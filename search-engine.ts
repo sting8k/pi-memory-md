@@ -17,6 +17,10 @@ export interface SearchHit {
 
 export type SearchField = "content" | "tags" | "description" | "all";
 
+const MAX_SEARCH_RESULTS = 10;
+const MAX_SNIPPET_CHARS = 500;
+const SEARCH_CONTEXT_LINES = 1;
+
 // ── Regex utilities ──
 
 const escapeRegex = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -150,7 +154,12 @@ const countMatches = (hay: string, terms: string[]): number => {
   return count;
 };
 
-const lineSnippet = (text: string, regex: RegExp, contextLines = 2): string => {
+const truncateSnippet = (snippet: string): string => {
+  if (snippet.length <= MAX_SNIPPET_CHARS) return snippet;
+  return `${snippet.slice(0, MAX_SNIPPET_CHARS).trimEnd()}\n...(truncated)`;
+};
+
+const lineSnippet = (text: string, regex: RegExp, contextLines = SEARCH_CONTEXT_LINES): string => {
   const lines = text.split("\n");
   let matchIdx = -1;
   for (let i = 0; i < lines.length; i++) {
@@ -159,7 +168,7 @@ const lineSnippet = (text: string, regex: RegExp, contextLines = 2): string => {
       break;
     }
   }
-  if (matchIdx === -1) return lines[0]?.substring(0, 100) ?? "";
+  if (matchIdx === -1) return truncateSnippet(lines[0] ?? "");
 
   const start = Math.max(0, matchIdx - contextLines);
   const end = Math.min(lines.length, matchIdx + contextLines + 1);
@@ -169,7 +178,7 @@ const lineSnippet = (text: string, regex: RegExp, contextLines = 2): string => {
   if (start > 0) parts.push(`...(${start} lines above)`);
   parts.push(...slice);
   if (end < lines.length) parts.push(`...(${lines.length - end} lines below)`);
-  return parts.join("\n");
+  return truncateSnippet(parts.join("\n"));
 };
 
 function buildSearchText(memory: MemoryFile, field: SearchField): string {
@@ -194,7 +203,7 @@ function detectMatchedFields(memory: MemoryFile, regex: RegExp): Array<"content"
 }
 
 function buildSnippet(memory: MemoryFile, searchIn: SearchField, regex: RegExp): string {
-  if (searchIn === "tags") return `Tags: ${memory.frontmatter.tags?.join(", ") ?? ""}`;
+  if (searchIn === "tags") return truncateSnippet(`Tags: ${memory.frontmatter.tags?.join(", ") ?? ""}`);
   const text = searchIn === "description" ? memory.frontmatter.description : memory.content;
   return lineSnippet(text, regex);
 }
@@ -231,7 +240,7 @@ export function searchMemoryFiles(input: SearchInput): SearchHit[] {
       });
     }
 
-    return hits;
+    return hits.slice(0, MAX_SEARCH_RESULTS);
   }
 
   // Natural language mode: OR match, sorted by matchCount desc
@@ -256,5 +265,5 @@ export function searchMemoryFiles(input: SearchInput): SearchHit[] {
   }
 
   hits.sort((a, b) => b.mc - a.mc);
-  return hits.map((h) => h.hit);
+  return hits.slice(0, MAX_SEARCH_RESULTS).map((h) => h.hit);
 }
