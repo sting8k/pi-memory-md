@@ -168,7 +168,7 @@ const lineSnippet = (text: string, regex: RegExp, contextLines = SEARCH_CONTEXT_
       break;
     }
   }
-  if (matchIdx === -1) return truncateSnippet(lines[0] ?? "");
+  if (matchIdx === -1) return truncateSnippet(lines.find((line) => line.trim()) ?? "");
 
   const start = Math.max(0, matchIdx - contextLines);
   const end = Math.min(lines.length, matchIdx + contextLines + 1);
@@ -203,9 +203,18 @@ function detectMatchedFields(memory: MemoryFile, regex: RegExp): Array<"content"
 }
 
 function buildSnippet(memory: MemoryFile, searchIn: SearchField, regex: RegExp): string {
-  if (searchIn === "tags") return truncateSnippet(`Tags: ${memory.frontmatter.tags?.join(", ") ?? ""}`);
-  const text = searchIn === "description" ? memory.frontmatter.description : memory.content;
-  return lineSnippet(text, regex);
+  const tags = memory.frontmatter.tags?.join(", ") ?? "";
+  const tagSnippet = () => truncateSnippet(`Tags: ${tags}`);
+  const descriptionSnippet = () => truncateSnippet(memory.frontmatter.description);
+
+  if (searchIn === "tags") return tagSnippet();
+  if (searchIn === "description") return descriptionSnippet();
+  if (searchIn === "all") {
+    if (regex.test(memory.content)) return lineSnippet(memory.content, regex);
+    if (memory.frontmatter.tags?.some((tag) => regex.test(tag))) return tagSnippet();
+    if (regex.test(memory.frontmatter.description)) return descriptionSnippet();
+  }
+  return lineSnippet(memory.content, regex);
 }
 
 // ── Main search function ──
