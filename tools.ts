@@ -40,8 +40,8 @@ function buildToolCallText(name: string, args: Record<string, unknown>, theme: T
   const text = theme.fg("toolTitle", theme.bold(name));
   const entries = Object.entries(args).filter(([, v]) => v !== undefined);
   if (entries.length === 0) return text;
-  const [_key, value] = entries[0];
-  return `${text} ${theme.fg("accent", formatValue(value))}`;
+  const preferred = entries.find(([k]) => k === "path" || k === "action") || entries[0];
+  return `${text} ${theme.fg("accent", formatValue(preferred[1]))}`;
 }
 
 function getResultText(result: { content: Array<{ type: string; text?: string }> }): string {
