@@ -1,0 +1,23 @@
+{
+  "strictness": 3,
+  "commentTypes": ["logic", "syntax"],
+  "fileChangeLimit": 200,
+  "triggerOnUpdates": false,
+  "statusCheck": true,
+  "statusCommentsEnabled": true,
+  "updateExistingSummaryComment": true,
+  "ignorePatterns": "node_modules/**\ndist/**\ncoverage/**\n.tmp*/**\n**/*.generated.*\npackage-lock.json",
+  "excludeAuthors": ["github-actions[bot]", "dependabot[bot]"],
+  "ignoreKeywords": "release:\nwip:",
+  "disabledLabels": ["no-greptile", "wip"],
+  "includeBranches": ["main"],
+  "instructions": "Prioritize clear correctness bugs, runtime errors, data loss risks, and missing validation. Avoid speculative edge cases and style nits.",
+  "rules": [
+    {
+      "id": "bounded-tool-output",
+      "rule": "Tool outputs shown to users or agents should be bounded and avoid dumping large file contents unless explicitly requested.",
+      "severity": "medium",
+      "scope": ["tools.ts", "search-engine.ts"]
+    }
+  ]
+}

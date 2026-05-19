@@ -44,6 +44,288 @@ export function getMemoryDir(settings: MemoryMdSettings, cwd: string): string {
   return path.join(localPath, path.basename(cwd));
 }
 
+export type MemoryMigrateMode = "move" | "merge";
+
+export interface MemoryMigrateInput {
+  cwd: string;
+  from: string;
+  to?: string;
+  mode?: MemoryMigrateMode;
+  dryRun?: boolean;
+}
+
+export interface MemoryMigrateResult {
+  success: boolean;
+  message: string;
+  dryRun: boolean;
+  mode: MemoryMigrateMode;
+  from: string;
+  to: string;
+  fromPath: string;
+  toPath: string;
+  files: number;
+  conflicts: string[];
+  candidates?: string[];
+}
+
+function validateProjectFolderName(name: string, label: string): string | null {
+  if (!name.trim()) return `${label} is required`;
+  if (path.isAbsolute(name) || name.includes("/") || name.includes("\\") || name === "." || name === "..") {
+    return `${label} must be a workspace folder name, not a path`;
+  }
+  return null;
+}
+
+function listProjectMemoryFolders(memoryRoot: string): string[] {
+  if (!fs.existsSync(memoryRoot)) return [];
+  return fs
+    .readdirSync(memoryRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && entry.name !== ".git")
+    .map((entry) => entry.name)
+    .sort();
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException).code === "ENOENT";
+}
+
+function formatFsError(error: unknown): string {
+  const err = error as NodeJS.ErrnoException;
+  return err.message || String(error);
+}
+
+function lstatIfExists(targetPath: string): fs.Stats | null {
+  try {
+    return fs.lstatSync(targetPath);
+  } catch (error) {
+    if (isNotFoundError(error)) return null;
+    throw error;
+  }
+}
+
+interface FileInventory {
+  files: string[];
+  symlinks: string[];
+}
+
+function listFilesRecursive(dir: string): FileInventory {
+  const files: string[] = [];
+  const symlinks: string[] = [];
+
+  function walk(current: string) {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const fullPath = path.join(current, entry.name);
+      if (entry.isSymbolicLink()) {
+        symlinks.push(fullPath);
+      } else if (entry.isDirectory()) {
+        walk(fullPath);
+      } else if (entry.isFile()) {
+        files.push(fullPath);
+      }
+    }
+  }
+
+  walk(dir);
+  return { files: files.sort(), symlinks: symlinks.sort() };
+}
+
+function detectMergeConflicts(toPath: string, relativeFiles: string[]): string[] {
+  const conflicts: string[] = [];
+
+  for (const relPath of relativeFiles) {
+    const destFile = path.join(toPath, relPath);
+    if (lstatIfExists(destFile)) {
+      conflicts.push(relPath);
+      continue;
+    }
+
+    const parts = relPath.split(path.sep);
+    for (let i = 1; i < parts.length; i++) {
+      const ancestor = path.join(toPath, ...parts.slice(0, i));
+      const ancestorStats = lstatIfExists(ancestor);
+      if (ancestorStats && !ancestorStats.isDirectory()) {
+        conflicts.push(relPath);
+        break;
+      }
+    }
+  }
+
+  return conflicts;
+}
+
+function getMissingDirectories(targetDir: string, stopDir: string): string[] {
+  const relative = path.relative(stopDir, targetDir);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return [];
+
+  const missingDirs: string[] = [];
+  let current = stopDir;
+  for (const part of relative.split(path.sep)) {
+    current = path.join(current, part);
+    if (!lstatIfExists(current)) missingDirs.push(current);
+  }
+  return missingDirs;
+}
+
+function rollbackMergeWrites(
+  copiedFiles: string[],
+  attemptedFile: string | null,
+  createdDirs: string[],
+  toPath: string,
+): string[] {
+  const failures: string[] = [];
+  const filesToRemove = attemptedFile ? [...copiedFiles, attemptedFile] : copiedFiles;
+
+  for (const file of [...new Set(filesToRemove)].reverse()) {
+    try {
+      fs.rmSync(file, { force: true });
+    } catch {
+      failures.push(path.relative(toPath, file));
+    }
+  }
+
+  const dirsToRemove = [...new Set(createdDirs)].sort((a, b) => b.length - a.length);
+  for (const dir of dirsToRemove) {
+    try {
+      fs.rmdirSync(dir);
+    } catch (error) {
+      if (!isNotFoundError(error)) failures.push(path.relative(toPath, dir));
+    }
+  }
+
+  return failures;
+}
+
+export function migrateMemoryProject(settings: MemoryMdSettings, input: MemoryMigrateInput): MemoryMigrateResult {
+  const mode = input.mode ?? "move";
+  const dryRun = input.dryRun ?? false;
+  const to = input.to?.trim() || path.basename(input.cwd);
+  const from = input.from.trim();
+  const currentMemoryDir = getMemoryDir(settings, input.cwd);
+  const memoryRoot = path.dirname(currentMemoryDir);
+  const fromPath = path.join(memoryRoot, from);
+  const toPath = path.join(memoryRoot, to);
+  const baseResult = { dryRun, mode, from, to, fromPath, toPath, files: 0, conflicts: [] as string[] };
+
+  const fail = (message: string, extra?: Partial<MemoryMigrateResult>): MemoryMigrateResult => ({
+    ...baseResult,
+    ...extra,
+    success: false,
+    message,
+  });
+
+  try {
+    const fromError = validateProjectFolderName(from, "from");
+    if (fromError) return fail(fromError);
+
+    const toError = validateProjectFolderName(to, "to");
+    if (toError) return fail(toError);
+
+    if (from === to) return fail("Source and destination project folders are the same");
+
+    const fromStats = lstatIfExists(fromPath);
+    if (!fromStats) {
+      return fail(`Source memory folder not found: ${from}`, { candidates: listProjectMemoryFolders(memoryRoot) });
+    }
+    if (!fromStats.isDirectory()) return fail(`Source exists but is not a directory: ${from}`);
+
+    const inventory = listFilesRecursive(fromPath);
+    const files = inventory.files;
+    const relativeFiles = files.map((file) => path.relative(fromPath, file));
+    const resultBase = { ...baseResult, files: files.length };
+    const symlinks = inventory.symlinks.map((file) => path.relative(fromPath, file));
+
+    const toStats = lstatIfExists(toPath);
+    if (!toStats) {
+      if (!dryRun) {
+        try {
+          fs.renameSync(fromPath, toPath);
+        } catch (error) {
+          return { ...resultBase, success: false, message: `Move failed: ${formatFsError(error)}` };
+        }
+      }
+      return { ...resultBase, success: true, message: `Moved project memory from ${from} to ${to}` };
+    }
+
+    if (!toStats.isDirectory()) {
+      return { ...resultBase, success: false, message: `Destination exists but is not a directory: ${to}` };
+    }
+
+    if (mode === "move") {
+      return {
+        ...resultBase,
+        success: false,
+        message: `Destination memory folder already exists: ${to}. Use mode: "merge" to merge without overwriting.`,
+      };
+    }
+
+    if (symlinks.length > 0) {
+      return {
+        ...resultBase,
+        success: false,
+        message: `Merge blocked by ${symlinks.length} unsupported symlink(s)`,
+        conflicts: symlinks,
+      };
+    }
+
+    const conflicts = detectMergeConflicts(toPath, relativeFiles);
+    if (conflicts.length > 0) {
+      return {
+        ...resultBase,
+        success: false,
+        message: `Merge blocked by ${conflicts.length} conflict(s)`,
+        conflicts,
+      };
+    }
+
+    if (!dryRun) {
+      const copiedFiles: string[] = [];
+      const createdDirs: string[] = [];
+      let currentRelPath = "";
+      let currentDestFile: string | null = null;
+
+      try {
+        for (const file of files) {
+          currentRelPath = path.relative(fromPath, file);
+          const destFile = path.join(toPath, currentRelPath);
+          currentDestFile = destFile;
+          const destDir = path.dirname(destFile);
+          const missingDirs = getMissingDirectories(destDir, toPath);
+          fs.mkdirSync(destDir, { recursive: true });
+          createdDirs.push(...missingDirs);
+          fs.copyFileSync(file, destFile, fs.constants.COPYFILE_EXCL);
+          copiedFiles.push(destFile);
+          currentDestFile = null;
+        }
+      } catch (error) {
+        const rollbackFailures = rollbackMergeWrites(copiedFiles, currentDestFile, createdDirs, toPath);
+        const rollbackMessage =
+          rollbackFailures.length === 0
+            ? "Destination writes were rolled back."
+            : `Rollback could not remove ${rollbackFailures.length} path(s): ${rollbackFailures.join(", ")}`;
+        return {
+          ...resultBase,
+          success: false,
+          message: `Merge failed while copying ${currentRelPath || "file"}: ${formatFsError(error)}. Source was left intact. ${rollbackMessage}`,
+        };
+      }
+
+      try {
+        fs.rmSync(fromPath, { recursive: true, force: true });
+      } catch (error) {
+        return {
+          ...resultBase,
+          success: false,
+          message: `Merge copied files into ${to}, but failed to remove source ${from}: ${formatFsError(error)}. Remove the source folder manually after verifying the destination.`,
+        };
+      }
+    }
+
+    return { ...resultBase, success: true, message: `Merged project memory from ${from} into ${to}` };
+  } catch (error) {
+    return fail(`Migration failed: ${formatFsError(error)}`);
+  }
+}
+
 function getRepoName(settings: MemoryMdSettings): string {
   if (!settings.repoUrl) return "memory-md";
   const match = settings.repoUrl.match(/\/([^/]+?)(\.git)?$/);
