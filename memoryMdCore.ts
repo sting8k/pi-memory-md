@@ -85,22 +85,48 @@ function listProjectMemoryFolders(memoryRoot: string): string[] {
     .sort();
 }
 
-function listFilesRecursive(dir: string): string[] {
+function isNotFoundError(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException).code === "ENOENT";
+}
+
+function formatFsError(error: unknown): string {
+  const err = error as NodeJS.ErrnoException;
+  return err.message || String(error);
+}
+
+function lstatIfExists(targetPath: string): fs.Stats | null {
+  try {
+    return fs.lstatSync(targetPath);
+  } catch (error) {
+    if (isNotFoundError(error)) return null;
+    throw error;
+  }
+}
+
+interface FileInventory {
+  files: string[];
+  symlinks: string[];
+}
+
+function listFilesRecursive(dir: string): FileInventory {
   const files: string[] = [];
+  const symlinks: string[] = [];
 
   function walk(current: string) {
     for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
       const fullPath = path.join(current, entry.name);
-      if (entry.isDirectory()) {
+      if (entry.isSymbolicLink()) {
+        symlinks.push(fullPath);
+      } else if (entry.isDirectory()) {
         walk(fullPath);
-      } else if (entry.isFile() || entry.isSymbolicLink()) {
+      } else if (entry.isFile()) {
         files.push(fullPath);
       }
     }
   }
 
   walk(dir);
-  return files.sort();
+  return { files: files.sort(), symlinks: symlinks.sort() };
 }
 
 function detectMergeConflicts(toPath: string, relativeFiles: string[]): string[] {
@@ -108,7 +134,7 @@ function detectMergeConflicts(toPath: string, relativeFiles: string[]): string[]
 
   for (const relPath of relativeFiles) {
     const destFile = path.join(toPath, relPath);
-    if (fs.existsSync(destFile)) {
+    if (lstatIfExists(destFile)) {
       conflicts.push(relPath);
       continue;
     }
@@ -116,7 +142,8 @@ function detectMergeConflicts(toPath: string, relativeFiles: string[]): string[]
     const parts = relPath.split(path.sep);
     for (let i = 1; i < parts.length; i++) {
       const ancestor = path.join(toPath, ...parts.slice(0, i));
-      if (fs.existsSync(ancestor) && !fs.statSync(ancestor).isDirectory()) {
+      const ancestorStats = lstatIfExists(ancestor);
+      if (ancestorStats && !ancestorStats.isDirectory()) {
         conflicts.push(relPath);
         break;
       }
@@ -124,6 +151,20 @@ function detectMergeConflicts(toPath: string, relativeFiles: string[]): string[]
   }
 
   return conflicts;
+}
+
+function rollbackCopiedFiles(copiedFiles: string[], toPath: string): string[] {
+  const failures: string[] = [];
+
+  for (const file of [...copiedFiles].reverse()) {
+    try {
+      fs.rmSync(file, { force: true });
+    } catch {
+      failures.push(path.relative(toPath, file));
+    }
+  }
+
+  return failures;
 }
 
 export function migrateMemoryProject(settings: MemoryMdSettings, input: MemoryMigrateInput): MemoryMigrateResult {
@@ -135,69 +176,119 @@ export function migrateMemoryProject(settings: MemoryMdSettings, input: MemoryMi
   const memoryRoot = path.dirname(currentMemoryDir);
   const fromPath = path.join(memoryRoot, from);
   const toPath = path.join(memoryRoot, to);
-  const baseResult = { dryRun, mode, from, to, fromPath, toPath, files: 0, conflicts: [] };
+  const baseResult = { dryRun, mode, from, to, fromPath, toPath, files: 0, conflicts: [] as string[] };
 
-  const fromError = validateProjectFolderName(from, "from");
-  if (fromError) return { ...baseResult, success: false, message: fromError };
+  const fail = (message: string, extra?: Partial<MemoryMigrateResult>): MemoryMigrateResult => ({
+    ...baseResult,
+    ...extra,
+    success: false,
+    message,
+  });
 
-  const toError = validateProjectFolderName(to, "to");
-  if (toError) return { ...baseResult, success: false, message: toError };
+  try {
+    const fromError = validateProjectFolderName(from, "from");
+    if (fromError) return fail(fromError);
 
-  if (from === to) {
-    return { ...baseResult, success: false, message: "Source and destination project folders are the same" };
-  }
+    const toError = validateProjectFolderName(to, "to");
+    if (toError) return fail(toError);
 
-  if (!fs.existsSync(fromPath) || !fs.statSync(fromPath).isDirectory()) {
-    return {
-      ...baseResult,
-      success: false,
-      message: `Source memory folder not found: ${from}`,
-      candidates: listProjectMemoryFolders(memoryRoot),
-    };
-  }
+    if (from === to) return fail("Source and destination project folders are the same");
 
-  const files = listFilesRecursive(fromPath);
-  const relativeFiles = files.map((file) => path.relative(fromPath, file));
-  const resultBase = { ...baseResult, files: files.length };
-
-  if (!fs.existsSync(toPath)) {
-    if (!dryRun) fs.renameSync(fromPath, toPath);
-    return { ...resultBase, success: true, message: `Moved project memory from ${from} to ${to}` };
-  }
-
-  if (!fs.statSync(toPath).isDirectory()) {
-    return { ...resultBase, success: false, message: `Destination exists but is not a directory: ${to}` };
-  }
-
-  if (mode === "move") {
-    return {
-      ...resultBase,
-      success: false,
-      message: `Destination memory folder already exists: ${to}. Use mode: "merge" to merge without overwriting.`,
-    };
-  }
-
-  const conflicts = detectMergeConflicts(toPath, relativeFiles);
-  if (conflicts.length > 0) {
-    return {
-      ...resultBase,
-      success: false,
-      message: `Merge blocked by ${conflicts.length} conflict(s)`,
-      conflicts,
-    };
-  }
-
-  if (!dryRun) {
-    for (const file of files) {
-      const relPath = path.relative(fromPath, file);
-      const destFile = path.join(toPath, relPath);
-      fs.mkdirSync(path.dirname(destFile), { recursive: true });
-      fs.copyFileSync(file, destFile);
+    const fromStats = lstatIfExists(fromPath);
+    if (!fromStats) {
+      return fail(`Source memory folder not found: ${from}`, { candidates: listProjectMemoryFolders(memoryRoot) });
     }
-    fs.rmSync(fromPath, { recursive: true, force: true });
-  }
+    if (!fromStats.isDirectory()) return fail(`Source exists but is not a directory: ${from}`);
 
-  return { ...resultBase, success: true, message: `Merged project memory from ${from} into ${to}` };
+    const inventory = listFilesRecursive(fromPath);
+    const files = inventory.files;
+    const relativeFiles = files.map((file) => path.relative(fromPath, file));
+    const resultBase = { ...baseResult, files: files.length };
+    const symlinks = inventory.symlinks.map((file) => path.relative(fromPath, file));
+
+    if (symlinks.length > 0) {
+      return {
+        ...resultBase,
+        success: false,
+        message: `Migration blocked by ${symlinks.length} unsupported symlink(s)`,
+        conflicts: symlinks,
+      };
+    }
+
+    const toStats = lstatIfExists(toPath);
+    if (!toStats) {
+      if (!dryRun) {
+        try {
+          fs.renameSync(fromPath, toPath);
+        } catch (error) {
+          return { ...resultBase, success: false, message: `Move failed: ${formatFsError(error)}` };
+        }
+      }
+      return { ...resultBase, success: true, message: `Moved project memory from ${from} to ${to}` };
+    }
+
+    if (!toStats.isDirectory()) {
+      return { ...resultBase, success: false, message: `Destination exists but is not a directory: ${to}` };
+    }
+
+    if (mode === "move") {
+      return {
+        ...resultBase,
+        success: false,
+        message: `Destination memory folder already exists: ${to}. Use mode: "merge" to merge without overwriting.`,
+      };
+    }
+
+    const conflicts = detectMergeConflicts(toPath, relativeFiles);
+    if (conflicts.length > 0) {
+      return {
+        ...resultBase,
+        success: false,
+        message: `Merge blocked by ${conflicts.length} conflict(s)`,
+        conflicts,
+      };
+    }
+
+    if (!dryRun) {
+      const copiedFiles: string[] = [];
+      let currentRelPath = "";
+
+      try {
+        for (const file of files) {
+          currentRelPath = path.relative(fromPath, file);
+          const destFile = path.join(toPath, currentRelPath);
+          fs.mkdirSync(path.dirname(destFile), { recursive: true });
+          fs.copyFileSync(file, destFile);
+          copiedFiles.push(destFile);
+        }
+      } catch (error) {
+        const rollbackFailures = rollbackCopiedFiles(copiedFiles, toPath);
+        const rollbackMessage =
+          rollbackFailures.length === 0
+            ? "Copied files were rolled back."
+            : `Rollback failed for ${rollbackFailures.length} file(s): ${rollbackFailures.join(", ")}`;
+        return {
+          ...resultBase,
+          success: false,
+          message: `Merge failed while copying ${currentRelPath || "file"}: ${formatFsError(error)}. Source was left intact. ${rollbackMessage}`,
+        };
+      }
+
+      try {
+        fs.rmSync(fromPath, { recursive: true, force: true });
+      } catch (error) {
+        return {
+          ...resultBase,
+          success: false,
+          message: `Merge copied files into ${to}, but failed to remove source ${from}: ${formatFsError(error)}. Remove the source folder manually after verifying the destination.`,
+        };
+      }
+    }
+
+    return { ...resultBase, success: true, message: `Merged project memory from ${from} into ${to}` };
+  } catch (error) {
+    return fail(`Migration failed: ${formatFsError(error)}`);
+  }
 }
 
 function getRepoName(settings: MemoryMdSettings): string {
