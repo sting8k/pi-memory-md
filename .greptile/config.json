@@ -1,0 +1,35 @@
+{
+  "strictness": 2,
+  "commentTypes": ["logic", "syntax"],
+  "fileChangeLimit": 200,
+  "triggerOnUpdates": false,
+  "statusCheck": true,
+  "statusCommentsEnabled": true,
+  "updateExistingSummaryComment": true,
+  "ignorePatterns": "node_modules/**\ndist/**\ncoverage/**\n.tmp*/**\n**/*.generated.*\npackage-lock.json",
+  "excludeAuthors": ["github-actions[bot]", "dependabot[bot]"],
+  "ignoreKeywords": "release:\nwip:",
+  "disabledLabels": ["no-greptile", "wip"],
+  "includeBranches": ["main"],
+  "instructions": "This is a TypeScript Pi extension for filesystem-backed memory. Prioritize correctness, data-loss prevention, path traversal safety, git/memory persistence safety, user-visible output bounds, and missing verification. Avoid style nits.",
+  "rules": [
+    {
+      "id": "safe-file-operations",
+      "rule": "Filesystem operations must validate user-controlled paths or folder names, avoid path traversal, and avoid overwriting or deleting data without explicit conflict handling.",
+      "severity": "high",
+      "scope": ["*.ts", "**/*.ts"]
+    },
+    {
+      "id": "bounded-tool-output",
+      "rule": "Tool outputs shown to users or agents should be bounded and avoid dumping large file contents unless the user explicitly requests it.",
+      "severity": "medium",
+      "scope": ["*.ts", "**/*.ts"]
+    },
+    {
+      "id": "actionable-errors",
+      "rule": "Do not swallow errors silently. Return or propagate useful context so the caller knows what failed and how to recover.",
+      "severity": "medium",
+      "scope": ["*.ts", "**/*.ts"]
+    }
+  ]
+}

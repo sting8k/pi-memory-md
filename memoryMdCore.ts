@@ -44,6 +44,162 @@ export function getMemoryDir(settings: MemoryMdSettings, cwd: string): string {
   return path.join(localPath, path.basename(cwd));
 }
 
+export type MemoryMigrateMode = "move" | "merge";
+
+export interface MemoryMigrateInput {
+  cwd: string;
+  from: string;
+  to?: string;
+  mode?: MemoryMigrateMode;
+  dryRun?: boolean;
+}
+
+export interface MemoryMigrateResult {
+  success: boolean;
+  message: string;
+  dryRun: boolean;
+  mode: MemoryMigrateMode;
+  from: string;
+  to: string;
+  fromPath: string;
+  toPath: string;
+  files: number;
+  conflicts: string[];
+  candidates?: string[];
+}
+
+function validateProjectFolderName(name: string, label: string): string | null {
+  if (!name.trim()) return `${label} is required`;
+  if (path.isAbsolute(name) || name.includes("/") || name.includes("\\") || name === "." || name === "..") {
+    return `${label} must be a workspace folder name, not a path`;
+  }
+  return null;
+}
+
+function listProjectMemoryFolders(memoryRoot: string): string[] {
+  if (!fs.existsSync(memoryRoot)) return [];
+  return fs
+    .readdirSync(memoryRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && entry.name !== ".git")
+    .map((entry) => entry.name)
+    .sort();
+}
+
+function listFilesRecursive(dir: string): string[] {
+  const files: string[] = [];
+
+  function walk(current: string) {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        walk(fullPath);
+      } else if (entry.isFile() || entry.isSymbolicLink()) {
+        files.push(fullPath);
+      }
+    }
+  }
+
+  walk(dir);
+  return files.sort();
+}
+
+function detectMergeConflicts(toPath: string, relativeFiles: string[]): string[] {
+  const conflicts: string[] = [];
+
+  for (const relPath of relativeFiles) {
+    const destFile = path.join(toPath, relPath);
+    if (fs.existsSync(destFile)) {
+      conflicts.push(relPath);
+      continue;
+    }
+
+    const parts = relPath.split(path.sep);
+    for (let i = 1; i < parts.length; i++) {
+      const ancestor = path.join(toPath, ...parts.slice(0, i));
+      if (fs.existsSync(ancestor) && !fs.statSync(ancestor).isDirectory()) {
+        conflicts.push(relPath);
+        break;
+      }
+    }
+  }
+
+  return conflicts;
+}
+
+export function migrateMemoryProject(settings: MemoryMdSettings, input: MemoryMigrateInput): MemoryMigrateResult {
+  const mode = input.mode ?? "move";
+  const dryRun = input.dryRun ?? false;
+  const to = input.to?.trim() || path.basename(input.cwd);
+  const from = input.from.trim();
+  const currentMemoryDir = getMemoryDir(settings, input.cwd);
+  const memoryRoot = path.dirname(currentMemoryDir);
+  const fromPath = path.join(memoryRoot, from);
+  const toPath = path.join(memoryRoot, to);
+  const baseResult = { dryRun, mode, from, to, fromPath, toPath, files: 0, conflicts: [] };
+
+  const fromError = validateProjectFolderName(from, "from");
+  if (fromError) return { ...baseResult, success: false, message: fromError };
+
+  const toError = validateProjectFolderName(to, "to");
+  if (toError) return { ...baseResult, success: false, message: toError };
+
+  if (from === to) {
+    return { ...baseResult, success: false, message: "Source and destination project folders are the same" };
+  }
+
+  if (!fs.existsSync(fromPath) || !fs.statSync(fromPath).isDirectory()) {
+    return {
+      ...baseResult,
+      success: false,
+      message: `Source memory folder not found: ${from}`,
+      candidates: listProjectMemoryFolders(memoryRoot),
+    };
+  }
+
+  const files = listFilesRecursive(fromPath);
+  const relativeFiles = files.map((file) => path.relative(fromPath, file));
+  const resultBase = { ...baseResult, files: files.length };
+
+  if (!fs.existsSync(toPath)) {
+    if (!dryRun) fs.renameSync(fromPath, toPath);
+    return { ...resultBase, success: true, message: `Moved project memory from ${from} to ${to}` };
+  }
+
+  if (!fs.statSync(toPath).isDirectory()) {
+    return { ...resultBase, success: false, message: `Destination exists but is not a directory: ${to}` };
+  }
+
+  if (mode === "move") {
+    return {
+      ...resultBase,
+      success: false,
+      message: `Destination memory folder already exists: ${to}. Use mode: "merge" to merge without overwriting.`,
+    };
+  }
+
+  const conflicts = detectMergeConflicts(toPath, relativeFiles);
+  if (conflicts.length > 0) {
+    return {
+      ...resultBase,
+      success: false,
+      message: `Merge blocked by ${conflicts.length} conflict(s)`,
+      conflicts,
+    };
+  }
+
+  if (!dryRun) {
+    for (const file of files) {
+      const relPath = path.relative(fromPath, file);
+      const destFile = path.join(toPath, relPath);
+      fs.mkdirSync(path.dirname(destFile), { recursive: true });
+      fs.copyFileSync(file, destFile);
+    }
+    fs.rmSync(fromPath, { recursive: true, force: true });
+  }
+
+  return { ...resultBase, success: true, message: `Merged project memory from ${from} into ${to}` };
+}
+
 function getRepoName(settings: MemoryMdSettings): string {
   if (!settings.repoUrl) return "memory-md";
   const match = settings.repoUrl.match(/\/([^/]+?)(\.git)?$/);

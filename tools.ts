@@ -9,6 +9,7 @@ import {
   getMemoryDir,
   gitExec,
   listMemoryFiles,
+  migrateMemoryProject,
   readMemoryFile,
   syncRepository,
   writeMemoryFile,
@@ -40,7 +41,7 @@ function buildToolCallText(name: string, args: Record<string, unknown>, theme: T
   const text = theme.fg("toolTitle", theme.bold(name));
   const entries = Object.entries(args).filter(([, v]) => v !== undefined);
   if (entries.length === 0) return text;
-  const preferred = entries.find(([k]) => k === "path" || k === "action") || entries[0];
+  const preferred = entries.find(([k]) => k === "path" || k === "action" || k === "from" || k === "to") || entries[0];
   return `${text} ${theme.fg("accent", formatValue(preferred[1]))}`;
 }
 
@@ -130,6 +131,37 @@ function renderCountResult(
       theme.fg("success", `${details?.count ?? 0} ${label}`) + buildExpandHint(text.split("\n").length, theme),
     );
   return renderText(theme.fg("toolOutput", text));
+}
+
+function formatLimitedList(items: string[], limit = 20): string[] {
+  const visible = items.slice(0, limit).map((item) => `  - ${item}`);
+  if (items.length > limit) visible.push(`  ...and ${items.length - limit} more`);
+  return visible;
+}
+
+function formatMigrationResult(result: ReturnType<typeof migrateMemoryProject>): string {
+  if (!result.success) {
+    const lines = [result.message];
+    if (result.conflicts.length > 0) lines.push("", "Conflicts:", ...formatLimitedList(result.conflicts));
+    if (result.candidates && result.candidates.length > 0) {
+      lines.push("", "Existing project folders:", ...formatLimitedList(result.candidates));
+    }
+    return lines.join("\n");
+  }
+
+  const lines = [
+    result.dryRun ? "Migration preview:" : "Migrated project memory:",
+    `  from: ${result.from}`,
+    `  to: ${result.to}`,
+    `  mode: ${result.mode}`,
+    `  files: ${result.files}`,
+  ];
+
+  lines.push(
+    "",
+    result.dryRun ? "No changes made." : 'Run memory_sync(action="push") to commit and push the migration.',
+  );
+  return lines.join("\n");
 }
 
 export function registerMemorySync(
@@ -459,6 +491,43 @@ export function registerMemoryInit(
   });
 }
 
+export function registerMemoryMigrate(pi: ExtensionAPI, settings: MemoryMdSettings): void {
+  pi.registerTool({
+    name: "memory_migrate",
+    label: "Memory Migrate",
+    description: "Migrate project memory after renaming a workspace folder",
+    parameters: Type.Object({
+      from: Type.String({ description: "Old workspace folder name that owns the existing memory" }),
+      to: Type.Optional(Type.String({ description: "New workspace folder name. Defaults to the current workspace." })),
+      mode: Type.Optional(
+        Type.Union([Type.Literal("move"), Type.Literal("merge")], {
+          description: "move fails if destination exists; merge moves missing files and fails on conflicts.",
+        }),
+      ),
+      dryRun: Type.Optional(Type.Boolean({ description: "Preview migration without changing files" })),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const {
+        from,
+        to,
+        mode = "move",
+        dryRun = false,
+      } = params as { from: string; to?: string; mode?: "move" | "merge"; dryRun?: boolean };
+      const result = migrateMemoryProject(settings, { cwd: ctx.cwd, from, to, mode, dryRun });
+
+      return {
+        content: [{ type: "text", text: formatMigrationResult(result) }],
+        details: result,
+      };
+    },
+
+    renderCall: (args, theme) => new Text(buildToolCallText("memory_migrate", args, theme), 0, 0),
+    renderResult: (result, options, theme) =>
+      options.isPartial ? renderText(theme.fg("warning", "Migrating...")) : renderSyncResult(result, options, theme),
+  });
+}
+
 export function registerMemoryCheck(pi: ExtensionAPI, settings: MemoryMdSettings): void {
   pi.registerTool({
     name: "memory_check",
@@ -528,5 +597,6 @@ export function registerAllMemoryTools(
   registerMemoryList(pi, settings);
   registerMemorySearch(pi, settings);
   registerMemoryInit(pi, settings, isRepoInitialized);
+  registerMemoryMigrate(pi, settings);
   registerMemoryCheck(pi, settings);
 }
