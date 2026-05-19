@@ -73,6 +73,7 @@ function validateProjectFolderName(name: string, label: string): string | null {
   if (path.isAbsolute(name) || name.includes("/") || name.includes("\\") || name === "." || name === "..") {
     return `${label} must be a workspace folder name, not a path`;
   }
+  if (name.startsWith(".")) return `${label} must not be a hidden or reserved folder name`;
   return null;
 }
 
