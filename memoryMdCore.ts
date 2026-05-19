@@ -206,15 +206,6 @@ export function migrateMemoryProject(settings: MemoryMdSettings, input: MemoryMi
     const resultBase = { ...baseResult, files: files.length };
     const symlinks = inventory.symlinks.map((file) => path.relative(fromPath, file));
 
-    if (symlinks.length > 0) {
-      return {
-        ...resultBase,
-        success: false,
-        message: `Migration blocked by ${symlinks.length} unsupported symlink(s)`,
-        conflicts: symlinks,
-      };
-    }
-
     const toStats = lstatIfExists(toPath);
     if (!toStats) {
       if (!dryRun) {
@@ -236,6 +227,15 @@ export function migrateMemoryProject(settings: MemoryMdSettings, input: MemoryMi
         ...resultBase,
         success: false,
         message: `Destination memory folder already exists: ${to}. Use mode: "merge" to merge without overwriting.`,
+      };
+    }
+
+    if (symlinks.length > 0) {
+      return {
+        ...resultBase,
+        success: false,
+        message: `Merge blocked by ${symlinks.length} unsupported symlink(s)`,
+        conflicts: symlinks,
       };
     }
 
