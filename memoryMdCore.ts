@@ -153,14 +153,42 @@ function detectMergeConflicts(toPath: string, relativeFiles: string[]): string[]
   return conflicts;
 }
 
-function rollbackCopiedFiles(copiedFiles: string[], toPath: string): string[] {
-  const failures: string[] = [];
+function getMissingDirectories(targetDir: string, stopDir: string): string[] {
+  const relative = path.relative(stopDir, targetDir);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return [];
 
-  for (const file of [...copiedFiles].reverse()) {
+  const missingDirs: string[] = [];
+  let current = stopDir;
+  for (const part of relative.split(path.sep)) {
+    current = path.join(current, part);
+    if (!lstatIfExists(current)) missingDirs.push(current);
+  }
+  return missingDirs;
+}
+
+function rollbackMergeWrites(
+  copiedFiles: string[],
+  attemptedFile: string | null,
+  createdDirs: string[],
+  toPath: string,
+): string[] {
+  const failures: string[] = [];
+  const filesToRemove = attemptedFile ? [...copiedFiles, attemptedFile] : copiedFiles;
+
+  for (const file of [...new Set(filesToRemove)].reverse()) {
     try {
       fs.rmSync(file, { force: true });
     } catch {
       failures.push(path.relative(toPath, file));
+    }
+  }
+
+  const dirsToRemove = [...new Set(createdDirs)].sort((a, b) => b.length - a.length);
+  for (const dir of dirsToRemove) {
+    try {
+      fs.rmdirSync(dir);
+    } catch (error) {
+      if (!isNotFoundError(error)) failures.push(path.relative(toPath, dir));
     }
   }
 
@@ -251,22 +279,29 @@ export function migrateMemoryProject(settings: MemoryMdSettings, input: MemoryMi
 
     if (!dryRun) {
       const copiedFiles: string[] = [];
+      const createdDirs: string[] = [];
       let currentRelPath = "";
+      let currentDestFile: string | null = null;
 
       try {
         for (const file of files) {
           currentRelPath = path.relative(fromPath, file);
           const destFile = path.join(toPath, currentRelPath);
-          fs.mkdirSync(path.dirname(destFile), { recursive: true });
-          fs.copyFileSync(file, destFile);
+          currentDestFile = destFile;
+          const destDir = path.dirname(destFile);
+          const missingDirs = getMissingDirectories(destDir, toPath);
+          fs.mkdirSync(destDir, { recursive: true });
+          createdDirs.push(...missingDirs);
+          fs.copyFileSync(file, destFile, fs.constants.COPYFILE_EXCL);
           copiedFiles.push(destFile);
+          currentDestFile = null;
         }
       } catch (error) {
-        const rollbackFailures = rollbackCopiedFiles(copiedFiles, toPath);
+        const rollbackFailures = rollbackMergeWrites(copiedFiles, currentDestFile, createdDirs, toPath);
         const rollbackMessage =
           rollbackFailures.length === 0
-            ? "Copied files were rolled back."
-            : `Rollback failed for ${rollbackFailures.length} file(s): ${rollbackFailures.join(", ")}`;
+            ? "Destination writes were rolled back."
+            : `Rollback could not remove ${rollbackFailures.length} path(s): ${rollbackFailures.join(", ")}`;
         return {
           ...resultBase,
           success: false,
