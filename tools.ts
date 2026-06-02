@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import { keyHint } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import {
   getCurrentDate,
@@ -18,7 +18,7 @@ import { type SearchField, searchMemoryFiles } from "./search-engine.js";
 import type { MemoryFrontmatter, MemoryMdSettings } from "./types.js";
 
 // Re-export types for convenience
-export type { ToolRenderResultOptions } from "@mariozechner/pi-coding-agent";
+export type { ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
 export type { MemoryFrontmatter, MemoryMdSettings } from "./types.js";
 
 // ============================================================================

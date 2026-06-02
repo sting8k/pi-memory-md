@@ -1,6 +1,6 @@
-import type { ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import { keyHint } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { formatEntriesAsMessages } from "./tape-selector.js";
 import type { MemoryTapeService } from "./tape-service.js";
