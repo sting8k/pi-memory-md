@@ -591,12 +591,10 @@ export function registerAllMemoryTools(
   settings: MemoryMdSettings,
   isRepoInitialized: { value: boolean },
 ): void {
-  registerMemorySync(pi, settings, isRepoInitialized);
   registerMemoryRead(pi, settings);
   registerMemoryWrite(pi, settings);
   registerMemoryList(pi, settings);
   registerMemorySearch(pi, settings);
   registerMemoryInit(pi, settings, isRepoInitialized);
   registerMemoryMigrate(pi, settings);
-  registerMemoryCheck(pi, settings);
 }

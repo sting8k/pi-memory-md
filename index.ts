@@ -13,7 +13,6 @@ import {
 } from "./memoryMdCore.js";
 import { MemoryFileSelector } from "./tape/tape-selector.js";
 import { MemoryTapeService } from "./tape/tape-service.js";
-import { registerAllTapeTools } from "./tape/tape-tools.js";
 import { registerAllMemoryTools } from "./tools.js";
 
 /**
@@ -28,7 +27,6 @@ export default function memoryMdExtension(pi: ExtensionAPI) {
   let memoryInjected = false;
   let tapeService: MemoryTapeService | null = null;
   let contextSelector: MemoryFileSelector | null = null;
-  let tapeToolsRegistered = false;
 
   function initMemoryContext(
     ctx: ExtensionContext,
@@ -70,11 +68,6 @@ export default function memoryMdExtension(pi: ExtensionAPI) {
       tapeService = MemoryTapeService.create(memoryDir, settings.tape, projectName, sessionId);
       contextSelector = new MemoryFileSelector(tapeService, memoryDir);
       tapeService.recordSessionStart();
-
-      if (!tapeToolsRegistered) {
-        registerAllTapeTools(pi, tapeService);
-        tapeToolsRegistered = true;
-      }
 
       pi.on("message_start", (msgEvent, _msgCtx) => {
         if (!tapeService) return;
@@ -200,24 +193,13 @@ export default function memoryMdExtension(pi: ExtensionAPI) {
           const memoryFiles = contextSelector.selectFilesForContext(contextConfig.strategy || "smart", limit);
           const memoryContext = contextSelector.buildContextFromFiles([...alwaysInclude, ...memoryFiles]);
 
-          const tapeHint = `
-
----
-💡 Tape Context Management:
-Your conversation history is recorded in tape with anchors (checkpoints).
-- Use tape_info to check current tape status
-- Use tape_search to query historical entries by kind or content
-- Use tape_anchors to list all anchor checkpoints
-- Use tape_handoff to create a new anchor/checkpoint when starting a new task
-`;
-
           const fileCount = memoryFiles.length + alwaysInclude.length;
 
           if (mode === "system-prompt") {
             memoryInjected = true;
             ctx.ui.notify(`Tape mode: ${fileCount} memory files injected (overrides system prompt)`, "info");
             return {
-              systemPrompt: memoryContext + tapeHint,
+              systemPrompt: memoryContext,
             };
           }
 
@@ -226,7 +208,7 @@ Your conversation history is recorded in tape with anchors (checkpoints).
           return {
             message: {
               customType: "pi-memory-md-tape",
-              content: memoryContext + tapeHint,
+              content: memoryContext,
               display: false,
             },
           };
