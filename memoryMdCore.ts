@@ -578,6 +578,8 @@ function createDefaultFiles(memoryDir: string): void {
 
 export { createDefaultFiles, ensureDirectoryStructure };
 
+const MAX_INJECTED_MEMORY_FILES = 10;
+
 export function buildMemoryContext(settings: MemoryMdSettings, cwd: string): string {
   const memoryDir = getMemoryDir(settings, cwd);
   const coreDir = path.join(memoryDir, "core");
@@ -586,7 +588,11 @@ export function buildMemoryContext(settings: MemoryMdSettings, cwd: string): str
     return "";
   }
 
-  const files = listMemoryFiles(coreDir);
+  const files = listMemoryFiles(coreDir)
+    .map((filePath) => ({ filePath, mtimeMs: fs.statSync(filePath).mtimeMs }))
+    .sort((a, b) => b.mtimeMs - a.mtimeMs || a.filePath.localeCompare(b.filePath))
+    .slice(0, MAX_INJECTED_MEMORY_FILES)
+    .map(({ filePath }) => filePath);
   if (files.length === 0) {
     return "";
   }
