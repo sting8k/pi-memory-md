@@ -10,12 +10,15 @@ import {
   createMemoryId,
   findMemoryFileById,
   formatMemoryRead,
+  getConceptDictionary,
   getMemoryCatalog,
   getMemoryDir,
   MEMORY_FACTS_END,
   MEMORY_FACTS_START,
   memoryFileFromCatalogEntry,
   migrateMemoryProject,
+  normalizeConceptSearchQuery,
+  normalizeMemoryConcepts,
   parseMemoryFacts,
   readMemoryFile,
   resolveMemoryPath,
@@ -26,6 +29,7 @@ import {
   writeMemoryFile,
 } from "../.test-dist/memoryMdCore.js";
 import { searchMemoryFiles } from "../.test-dist/search-engine.js";
+import { registerMemorySearch, registerMemoryWrite } from "../.test-dist/tools.js";
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-v2-"));
@@ -33,6 +37,18 @@ function fixture() {
   fs.mkdirSync(path.join(workspace, ".git"), { recursive: true });
   const settings = { localPath: path.join(root, "memory") };
   return { root, workspace, settings };
+}
+
+function fakePi() {
+  const tools = new Map();
+  return {
+    tools,
+    pi: {
+      registerTool(tool) {
+        tools.set(tool.name, tool);
+      },
+    },
+  };
 }
 
 test("frontmatter parser reads legacy folded descriptions and block tags", () => {
@@ -171,6 +187,113 @@ test("facts DSL accepts JSON values and stable relations", () => {
 
   const invalid = `${MEMORY_FACTS_START}\nruntime.vram = 24 GiB\n${MEMORY_FACTS_END}`;
   assert.match(validateMemoryContent(invalid).error ?? "", /valid JSON/);
+});
+
+test("concept dictionary normalizes aliases and registers safe new concepts", () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const memoryDir = getMemoryDir(settings, workspace);
+    fs.mkdirSync(memoryDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(memoryDir, ".concepts.json"),
+      `${JSON.stringify(
+        {
+          version: 1,
+          concepts: ["identity-addressed-record", "metadata-cache", "semantic-projection"],
+          aliases: { "id-based-record": "identity-addressed-record", "knowledge-view": "semantic-projection" },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+    const normalized = normalizeMemoryConcepts(memoryDir, [
+      "ID based records",
+      "Knowledge View",
+      "compact context",
+      "metadata-cash",
+      "compact context",
+    ]);
+
+    assert.deepEqual(normalized.concepts, [
+      "compact-context",
+      "identity-addressed-record",
+      "metadata-cash",
+      "semantic-projection",
+    ]);
+    assert.deepEqual(normalized.audit.registered, ["compact-context", "metadata-cash"]);
+    assert.equal(normalized.audit.resolvedAliases["id-based-records"], "identity-addressed-record");
+    assert.equal(normalized.audit.resolvedAliases["knowledge-view"], "semantic-projection");
+    assert.deepEqual(normalized.audit.possibleDuplicates, [
+      { concept: "metadata-cash", candidate: "metadata-cache", score: 0.86 },
+    ]);
+
+    const dictionary = getConceptDictionary(memoryDir);
+    assert.deepEqual(dictionary.concepts, [
+      "compact-context",
+      "identity-addressed-record",
+      "metadata-cache",
+      "metadata-cash",
+      "semantic-projection",
+    ]);
+    assert.equal(normalizeConceptSearchQuery(memoryDir, "id based record"), "identity-addressed-record");
+    assert.equal(normalizeConceptSearchQuery(memoryDir, "free form query"), "free form query");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("memory tools normalize concepts transparently", async () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const memoryDir = getMemoryDir(settings, workspace);
+    fs.mkdirSync(memoryDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(memoryDir, ".concepts.json"),
+      `${JSON.stringify(
+        {
+          version: 1,
+          concepts: ["identity-addressed-record", "semantic-projection"],
+          aliases: { "id-based-record": "identity-addressed-record", "knowledge-view": "semantic-projection" },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+    const { pi, tools } = fakePi();
+    registerMemoryWrite(pi, settings);
+    registerMemorySearch(pi, settings);
+    const signal = new AbortController().signal;
+
+    const writeResult = await tools.get("memory_write").execute(
+      "write-1",
+      {
+        path: "events/concept-tool.md",
+        kind: "event",
+        description: "Concept tool test",
+        summary: "Concept aliases are normalized before records are written",
+        concepts: ["ID based records", "Knowledge View", "ID based record"],
+        claims: ["Tool calls should store canonical concepts"],
+      },
+      signal,
+      () => {},
+      { cwd: workspace },
+    );
+
+    assert.deepEqual(writeResult.details.frontmatter.concepts, ["identity-addressed-record", "semantic-projection"]);
+    assert.equal(writeResult.details.concepts.resolvedAliases["id-based-records"], "identity-addressed-record");
+    assert.equal(writeResult.details.concepts.resolvedAliases["knowledge-view"], "semantic-projection");
+
+    const searchResult = await tools
+      .get("memory_search")
+      .execute("search-1", { query: "id based record", searchIn: "concepts" }, signal, () => {}, { cwd: workspace });
+    assert.equal(searchResult.details.query, "identity-addressed-record");
+    assert.equal(searchResult.details.count, 1);
+    assert.equal(searchResult.details.results[0].path, path.join("records", "event.concept-tool.md"));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("structured memory records support compact semantic read and search", () => {

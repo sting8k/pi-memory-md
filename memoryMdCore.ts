@@ -4,6 +4,9 @@ import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { parseFrontmatter, stringifyFrontmatter } from "./frontmatter.js";
 import type {
+  ConceptDictionary,
+  ConceptDuplicateHint,
+  ConceptNormalizationAudit,
   GitResult,
   MemoryFactValue,
   MemoryFile,
@@ -614,6 +617,7 @@ const MEMORY_KEY_PATTERN = /^[a-z][a-z0-9_.-]*$/;
 const MEMORY_RECORDS_DIR = "records";
 const MEMORY_CATALOG_FILE = ".catalog.json";
 const MEMORY_CATALOG_VERSION = 2;
+const CONCEPT_DICTIONARY_FILE = ".concepts.json";
 
 export interface MemoryCatalogEntry {
   path: string;
@@ -662,6 +666,170 @@ function catalogPath(memoryDir: string): string {
   return path.join(memoryDir, MEMORY_CATALOG_FILE);
 }
 
+function conceptDictionaryPath(memoryDir: string): string {
+  return path.join(memoryDir, CONCEPT_DICTIONARY_FILE);
+}
+
+function emptyConceptAudit(): ConceptNormalizationAudit {
+  return { canonical: [], resolvedAliases: {}, registered: [], possibleDuplicates: [] };
+}
+
+export function normalizeConceptLabel(label: string): string {
+  return label
+    .trim()
+    .toLowerCase()
+    .replace(/['’]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function uniqueSorted(values: Iterable<string>): string[] {
+  return Array.from(new Set(values)).sort((a, b) => a.localeCompare(b));
+}
+
+function sanitizeConceptDictionary(value: unknown): ConceptDictionary {
+  const input = (value && typeof value === "object" ? value : {}) as Partial<ConceptDictionary>;
+  const concepts = new Set<string>();
+  for (const concept of Array.isArray(input.concepts) ? input.concepts : []) {
+    const normalized = normalizeConceptLabel(concept);
+    if (normalized) concepts.add(normalized);
+  }
+
+  const aliases: Record<string, string> = {};
+  const inputAliases = input.aliases && typeof input.aliases === "object" ? input.aliases : {};
+  for (const [alias, target] of Object.entries(inputAliases)) {
+    const normalizedAlias = normalizeConceptLabel(alias);
+    const normalizedTarget = normalizeConceptLabel(String(target));
+    if (!normalizedAlias || !normalizedTarget || normalizedAlias === normalizedTarget) continue;
+    concepts.add(normalizedTarget);
+    aliases[normalizedAlias] = normalizedTarget;
+  }
+
+  return { version: 1, concepts: uniqueSorted(concepts), aliases: Object.fromEntries(Object.entries(aliases).sort()) };
+}
+
+function writeConceptDictionary(memoryDir: string, dictionary: ConceptDictionary): void {
+  fs.mkdirSync(memoryDir, { recursive: true });
+  const target = conceptDictionaryPath(memoryDir);
+  const tmp = `${target}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(dictionary, null, 2)}\n`);
+  fs.renameSync(tmp, target);
+}
+
+export function rebuildConceptDictionary(memoryDir: string): ConceptDictionary {
+  const concepts = new Set<string>();
+  for (const filePath of listMemoryFiles(memoryDir)) {
+    const memory = readMemoryFile(filePath);
+    if (!memory) continue;
+    for (const concept of memory.frontmatter.concepts ?? []) {
+      const normalized = normalizeConceptLabel(concept);
+      if (normalized) concepts.add(normalized);
+    }
+  }
+
+  const dictionary: ConceptDictionary = { version: 1, concepts: uniqueSorted(concepts), aliases: {} };
+  writeConceptDictionary(memoryDir, dictionary);
+  return dictionary;
+}
+
+export function getConceptDictionary(memoryDir: string): ConceptDictionary {
+  try {
+    return sanitizeConceptDictionary(JSON.parse(fs.readFileSync(conceptDictionaryPath(memoryDir), "utf-8")));
+  } catch {
+    return rebuildConceptDictionary(memoryDir);
+  }
+}
+
+function editDistance(a: string, b: string): number {
+  const previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= a.length; i++) {
+    let prevDiagonal = previous[0];
+    previous[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const saved = previous[j];
+      previous[j] = Math.min(previous[j] + 1, previous[j - 1] + 1, prevDiagonal + (a[i - 1] === b[j - 1] ? 0 : 1));
+      prevDiagonal = saved;
+    }
+  }
+  return previous[b.length];
+}
+
+function conceptSimilarity(a: string, b: string): number {
+  if (!a || !b) return 0;
+  return 1 - editDistance(a, b) / Math.max(a.length, b.length);
+}
+
+function possibleDuplicateHints(concept: string, candidates: string[]): ConceptDuplicateHint[] {
+  return candidates
+    .map((candidate) => ({ concept, candidate, score: Number(conceptSimilarity(concept, candidate).toFixed(2)) }))
+    .filter((hint) => hint.score >= 0.82 && hint.score < 1)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3);
+}
+
+function resolveConcept(dictionary: ConceptDictionary, concept: string): { canonical: string; alias?: string } | null {
+  const normalized = normalizeConceptLabel(concept);
+  if (!normalized) return null;
+  if (dictionary.aliases[normalized]) return { canonical: dictionary.aliases[normalized], alias: normalized };
+  if (dictionary.concepts.includes(normalized)) return { canonical: normalized };
+  if (normalized.endsWith("s")) {
+    const singular = normalized.slice(0, -1);
+    if (dictionary.aliases[singular]) return { canonical: dictionary.aliases[singular], alias: normalized };
+    if (dictionary.concepts.includes(singular)) return { canonical: singular, alias: normalized };
+  }
+  return { canonical: normalized };
+}
+
+function resolveKnownConcept(dictionary: ConceptDictionary, concept: string): string | null {
+  const normalized = normalizeConceptLabel(concept);
+  if (!normalized) return null;
+  if (dictionary.aliases[normalized]) return dictionary.aliases[normalized];
+  if (dictionary.concepts.includes(normalized)) return normalized;
+  if (!normalized.endsWith("s")) return null;
+  const singular = normalized.slice(0, -1);
+  return dictionary.aliases[singular] ?? (dictionary.concepts.includes(singular) ? singular : null);
+}
+
+export function normalizeMemoryConcepts(
+  memoryDir: string,
+  concepts?: string[],
+): { concepts?: string[]; audit: ConceptNormalizationAudit } {
+  const audit = emptyConceptAudit();
+  if (!concepts?.length) return { audit };
+
+  const dictionary = getConceptDictionary(memoryDir);
+  const knownBefore = new Set(dictionary.concepts);
+  const canonical = new Set<string>();
+
+  for (const concept of concepts) {
+    const resolved = resolveConcept(dictionary, concept);
+    if (!resolved) continue;
+    canonical.add(resolved.canonical);
+    if (resolved.alias) audit.resolvedAliases[normalizeConceptLabel(concept)] = resolved.canonical;
+    if (!knownBefore.has(resolved.canonical)) {
+      audit.registered.push(resolved.canonical);
+      audit.possibleDuplicates.push(...possibleDuplicateHints(resolved.canonical, dictionary.concepts));
+      dictionary.concepts.push(resolved.canonical);
+      knownBefore.add(resolved.canonical);
+    }
+  }
+
+  dictionary.concepts = uniqueSorted(dictionary.concepts);
+  if (audit.registered.length > 0 || Object.keys(audit.resolvedAliases).length > 0)
+    writeConceptDictionary(memoryDir, dictionary);
+  audit.canonical = uniqueSorted(canonical);
+  audit.registered = uniqueSorted(audit.registered);
+  return { concepts: audit.canonical, audit };
+}
+
+export function normalizeConceptSearchQuery(memoryDir: string, query: string): string {
+  const dictionary = getConceptDictionary(memoryDir);
+  const parts = query.includes(",") ? query.split(",") : [query];
+  const normalized = parts
+    .map((part) => resolveKnownConcept(dictionary, part.trim()))
+    .filter((part): part is string => Boolean(part));
+  return normalized.length === parts.length ? normalized.join(" ") : query;
+}
 function isMemoryFactValue(value: unknown): value is MemoryFactValue {
   if (value === null) return true;
   if (["string", "number", "boolean"].includes(typeof value)) return true;

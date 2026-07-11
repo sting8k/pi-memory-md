@@ -38,6 +38,7 @@ Each Git workspace gets an isolated project directory derived from its Git root 
 - `event.*` IDs: atomic reports, research, investigations, benchmarks, and historical findings.
 - New writes are identity-addressed records. For ergonomic calls, `memory_write(path="events/foo.md", kind="event", ...)` writes `records/event.foo.md`.
 - `.catalog.json` is a rebuildable local catalog used for fast `@id` lookup, listing, latest-memory context, and search.
+- `.concepts.json` is a small project dictionary for canonical concept labels and aliases; writes update it transparently.
 - The extension injects metadata for only the 10 most recently updated catalog entries.
 - Full Markdown content is loaded on demand with `memory_read(view="full")`; compact semantic projections use `view="summary"` or `view="knowledge"`.
 
@@ -92,6 +93,7 @@ Prefer structured semantic fields over long prose. `memory_write` can generate c
 
 - `summary`: one-sentence gist;
 - `concepts`: retrieval concepts;
+  Concepts are normalized to canonical lowercase kebab-case labels through `.concepts.json`; known aliases resolve automatically and unknown concepts are auto-registered. Ambiguous near-duplicates are reported as hints, not blocked.
 - `claims`: decisions or conclusions;
 - `facts`: JSON scalar/array values rendered into the facts block;
 - `relations`: stable `@id` links rendered as relation facts;
@@ -108,6 +110,23 @@ relation.follow_up -> @event.next-investigation
 ```
 
 Fact values must be JSON scalars or arrays. Relations must point to a valid stable `@id`. Use `memory_read({ path: "@event.foo", view: "knowledge" })` to retrieve summary, concepts, claims, facts, and relations without optional notes/prose.
+
+## Concept normalization
+
+Project memory keeps concept vocabulary simple and transparent:
+
+```json
+{
+  "version": 1,
+  "concepts": ["identity-addressed-record", "semantic-projection"],
+  "aliases": {
+    "id-based-record": "identity-addressed-record",
+    "knowledge-view": "semantic-projection"
+  }
+}
+```
+
+`memory_write` normalizes concept spelling, resolves aliases, deduplicates concepts, and registers new concepts automatically. `memory_search({ searchIn: "concepts" })` is alias-aware. The tool does not silently merge ambiguous semantic near-duplicates; it only returns advisory duplicate hints in tool details.
 
 ## Legacy migration
 

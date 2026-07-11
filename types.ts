@@ -18,6 +18,25 @@ export interface StructuredMemoryFields {
   notes?: string;
 }
 
+export interface ConceptDictionary {
+  version: 1;
+  concepts: string[];
+  aliases: Record<string, string>;
+}
+
+export interface ConceptDuplicateHint {
+  concept: string;
+  candidate: string;
+  score: number;
+}
+
+export interface ConceptNormalizationAudit {
+  canonical: string[];
+  resolvedAliases: Record<string, string>;
+  registered: string[];
+  possibleDuplicates: ConceptDuplicateHint[];
+}
+
 export interface MemoryFrontmatter {
   id?: string;
   kind?: MemoryKind;

@@ -16,6 +16,8 @@ import {
   listMemoryFiles,
   memoryFileFromCatalogEntry,
   migrateMemoryProject,
+  normalizeConceptSearchQuery,
+  normalizeMemoryConcepts,
   readMemoryFile,
   resolveMemoryFile,
   resolveMemoryPath,
@@ -396,8 +398,19 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
         if (content && (Object.keys(facts ?? {}).length || Object.keys(relations ?? {}).length || notes)) {
           throw new Error("facts, relations, and notes are only generated when content is omitted");
         }
+        const conceptNormalization = normalizeMemoryConcepts(memoryDir, concepts);
+        const normalizedConcepts = conceptNormalization.concepts;
         const memoryContent =
-          content ?? buildStructuredMemoryContent({ description, summary, concepts, claims, facts, relations, notes });
+          content ??
+          buildStructuredMemoryContent({
+            description,
+            summary,
+            concepts: normalizedConcepts,
+            claims,
+            facts,
+            relations,
+            notes,
+          });
 
         const contentValidation = validateMemoryContent(memoryContent);
         if (!contentValidation.valid) throw new Error(contentValidation.error);
@@ -418,7 +431,7 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
           ...existing?.frontmatter,
           description,
           summary,
-          concepts,
+          concepts: normalizedConcepts,
           claims,
           created: existing?.frontmatter.created ?? today,
           updated: today,
@@ -432,7 +445,11 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
         const relTarget = path.relative(memoryDir, target.filePath);
         return {
           content: [{ type: "text", text: `Memory file written: ${relTarget} (@${target.id})` }],
-          details: { path: target.filePath, frontmatter: { ...frontmatter, id: target.id, kind: target.kind } },
+          details: {
+            path: target.filePath,
+            frontmatter: { ...frontmatter, id: target.id, kind: target.kind },
+            concepts: conceptNormalization.audit,
+          },
         };
       } catch (error) {
         return {
@@ -548,7 +565,8 @@ export function registerMemorySearch(pi: ExtensionAPI, settings: MemoryMdSetting
         fileMap.set(entry.path, memoryFileFromCatalogEntry(memoryDir, entry));
       }
 
-      const hits = searchMemoryFiles({ files: fileMap, query, searchIn, kind });
+      const normalizedQuery = searchIn === "concepts" ? normalizeConceptSearchQuery(memoryDir, query) : query;
+      const hits = searchMemoryFiles({ files: fileMap, query: normalizedQuery, searchIn, kind });
 
       const results = hits.map((h) => ({
         path: h.path,
@@ -567,7 +585,7 @@ export function registerMemorySearch(pi: ExtensionAPI, settings: MemoryMdSetting
                 : `Found ${results.length} result(s):\n\n${results.map((r) => `  ${r.path}\n  ${r.match}`).join("\n\n")}`,
           },
         ],
-        details: { results, count: results.length },
+        details: { results, count: results.length, query: normalizedQuery },
       };
     },
 

@@ -14,7 +14,8 @@ projects/<project-slug>/
 ├── records/
 │   ├── state.preferences.md
 │   └── event.local-extension-investigation.md
-└── .catalog.json
+├── .catalog.json
+└── .concepts.json
 ```
 
 ### `state.*` records
@@ -60,6 +61,8 @@ memory_write({
 
 The extension generates the stable ID from the logical path. For example, `events/local-extension-investigation.md` becomes `@event.local-extension-investigation` stored at `records/event.local-extension-investigation.md`. Do not create a new file merely to update canonical state.
 
+Concepts are normalized transparently through `.concepts.json`: use natural labels, and the tool lowercases/kebab-cases them, resolves known aliases, deduplicates them, and auto-registers new concepts. Ambiguous near-duplicates are returned as advisory details; they do not block writes.
+
 ## Reading
 
 Read by path:
@@ -80,7 +83,7 @@ Views:
 - `knowledge`: summary, concepts, claims, facts, relations;
 - `full`: full Markdown including optional notes/prose.
 
-Use `memory_list` for metadata and `memory_search` for on-demand retrieval. Session injection contains metadata for only the 10 most recently updated memories, not full content.
+Use `memory_list` for metadata and `memory_search` for on-demand retrieval. `memory_search({ searchIn: "concepts" })` is alias-aware. Session injection contains metadata for only the 10 most recently updated memories, not full content.
 
 ## Frontmatter
 
