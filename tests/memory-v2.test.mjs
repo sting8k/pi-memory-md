@@ -13,6 +13,7 @@ import {
   migrateMemoryProject,
   readMemoryFile,
   resolveMemoryPath,
+  syncRepository,
   validateMemoryContent,
   writeMemoryFile,
 } from "../.test-dist/memoryMdCore.js";
@@ -61,6 +62,23 @@ test("project memory is scoped to the Git root slug", () => {
     const nested = path.join(workspace, "packages", "app");
     fs.mkdirSync(nested, { recursive: true });
     assert.equal(getMemoryDir(settings, nested), path.join(settings.localPath, "projects", "my-project"));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("local-only repository initialization does not require a repo URL", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-local-init-"));
+  const initialized = { value: false };
+  try {
+    const result = await syncRepository(
+      { exec: () => assert.fail("local-only initialization must not invoke git") },
+      { localPath: path.join(root, "memory"), repoUrl: "" },
+      initialized,
+    );
+    assert.equal(result.success, true);
+    assert.equal(initialized.value, true);
+    assert.equal(fs.existsSync(path.join(root, "memory")), true);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

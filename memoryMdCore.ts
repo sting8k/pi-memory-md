@@ -553,8 +553,14 @@ export async function syncRepository(
 ): Promise<{ success: boolean; message: string; updated?: boolean }> {
   const { localPath, repoUrl } = settings;
 
-  if (!repoUrl || !localPath) {
-    return { success: false, message: "GitHub repo URL or local path not configured" };
+  if (!localPath) {
+    return { success: false, message: "Local memory path not configured" };
+  }
+
+  if (!repoUrl) {
+    fs.mkdirSync(localPath, { recursive: true });
+    isRepoInitialized.value = true;
+    return { success: true, message: `Using local memory directory: ${localPath}` };
   }
 
   const repoName = getRepoName(settings);
