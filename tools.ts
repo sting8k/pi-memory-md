@@ -7,6 +7,7 @@ import { Type } from "@sinclair/typebox";
 import {
   buildStructuredMemoryContent,
   createDefaultFiles,
+  deleteMemoryFile,
   ensureDirectoryStructure,
   formatMemoryRead,
   getCurrentDate,
@@ -550,6 +551,38 @@ export function registerMemoryList(pi: ExtensionAPI, settings: MemoryMdSettings)
   });
 }
 
+export function registerMemoryDelete(pi: ExtensionAPI, settings: MemoryMdSettings): void {
+  pi.registerTool({
+    name: "memory_delete",
+    label: "Memory Delete",
+    description:
+      "Delete a project memory record by stable @id or path, then update derived catalog and concept dictionary",
+    parameters: Type.Object({
+      path: Type.String({ description: "Stable @id or memory path to delete" }),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const { path: target } = params as { path: string };
+      const memoryDir = getMemoryDir(settings, ctx.cwd);
+      try {
+        const deleted = deleteMemoryFile(memoryDir, target);
+        return {
+          content: [{ type: "text", text: `Memory deleted: ${deleted.path} (@${deleted.id})` }],
+          details: { ...deleted, conceptCount: deleted.dictionary.concepts.length },
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Failed to delete memory: ${(error as Error).message}` }],
+          details: { error: true },
+        };
+      }
+    },
+
+    renderCall: (args, theme) => new Text(buildToolCallText("memory_delete", args, theme), 0, 0),
+    renderResult: (result, options, theme) => renderCollapsed("Memory delete", getResultText(result), options, theme),
+  });
+}
+
 export function registerMemorySearch(pi: ExtensionAPI, settings: MemoryMdSettings): void {
   pi.registerTool({
     name: "memory_search",
@@ -591,8 +624,28 @@ export function registerMemorySearch(pi: ExtensionAPI, settings: MemoryMdSetting
       };
       const memoryDir = getMemoryDir(settings, ctx.cwd);
       const fileMap = new Map<string, import("./types.js").MemoryFile>();
+      const needsContent = searchIn === "content" || searchIn === "all";
       for (const entry of getMemoryCatalog(memoryDir)) {
-        fileMap.set(entry.path, memoryFileFromCatalogEntry(memoryDir, entry));
+        fileMap.set(
+          entry.path,
+          needsContent
+            ? memoryFileFromCatalogEntry(memoryDir, entry)
+            : {
+                path: path.join(memoryDir, entry.path),
+                frontmatter: {
+                  id: entry.id,
+                  kind: entry.kind,
+                  description: entry.description,
+                  summary: entry.summary,
+                  concepts: entry.concepts,
+                  claims: entry.claims,
+                  tags: entry.tags,
+                  created: entry.created,
+                  updated: entry.updated,
+                },
+                content: "",
+              },
+        );
       }
 
       const normalizedQuery = searchIn === "concepts" ? normalizeConceptSearchQuery(memoryDir, query) : query;
@@ -779,6 +832,7 @@ export function registerAllMemoryTools(
   registerMemoryWrite(pi, settings);
   registerMemoryList(pi, settings);
   registerMemorySearch(pi, settings);
+  registerMemoryDelete(pi, settings);
   registerMemoryInit(pi, settings, isRepoInitialized);
   registerMemoryMigrate(pi, settings);
 }

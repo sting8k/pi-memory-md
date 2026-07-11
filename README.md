@@ -37,7 +37,7 @@ Each Git workspace gets an isolated project directory derived from its Git root 
 - `state.*` IDs: canonical facts that are still current, such as preferences, environment, architecture, and active workflow.
 - `event.*` IDs: atomic reports, research, investigations, benchmarks, and historical findings.
 - New writes are identity-addressed records. For ergonomic calls, `memory_write(path="events/foo.md", kind="event", ...)` writes `records/event.foo.md`.
-- `.catalog.json` is a rebuildable local catalog used for fast `@id` lookup, listing, latest-memory context, and search.
+- `.catalog.json` is a rebuildable slim metadata catalog used for fast `@id` lookup, listing, latest-memory context, and metadata search. It does not store full Markdown content.
 - `.concepts.json` is a small project dictionary for canonical concept labels and aliases; writes update it transparently.
 - The extension injects metadata for only the 10 most recently updated catalog entries.
 - Full Markdown content is loaded on demand with `memory_read(view="full")`; compact semantic projections use `view="summary"` or `view="knowledge"`.
@@ -50,6 +50,7 @@ Each Git workspace gets an isolated project directory derived from its Git root 
 | `memory_write` | Create or fully replace one memory file, preferably from structured semantic fields |
 | `memory_list` | List project memory metadata |
 | `memory_search` | Search content or metadata, optionally by kind |
+| `memory_delete` | Explicitly delete one memory record and reconcile derived metadata |
 | `memory_init` | Initialize identity-addressed `records/` |
 | `memory_sync` | Pull, push, or inspect the backing repository |
 | `memory_migrate` | Rename a project or migrate a legacy project layout |
@@ -70,14 +71,6 @@ updated: "2026-07-11T14:37:00.000Z"
 ---
 # Runtime investigation
 
-## Summary
-Concise finding here.
-
-## Concepts
-- core-concept
-
-## Claims
-- Important conclusion.
 
 <!-- memory:facts:v1 -->
 runtime.local_path_requires_install = false
@@ -99,7 +92,7 @@ Prefer structured semantic fields over long prose. `memory_write` can generate c
 - `relations`: stable `@id` links rendered as relation facts;
 - `notes`: optional evidence/prose loaded only in full view.
 
-A memory may still include one machine-checkable fact block. Markdown outside it stays unrestricted for compatibility.
+Generated structured Markdown keeps `summary`, `concepts`, and `claims` in frontmatter/read projections instead of repeating them in the body. A memory may still include one machine-checkable fact block. Markdown outside it stays unrestricted for compatibility.
 
 ```markdown
 <!-- memory:facts:v1 -->
@@ -128,7 +121,7 @@ Project memory keeps concept vocabulary simple and transparent:
 
 `memory_write` normalizes concept spelling, resolves aliases, deduplicates concepts, and registers new concepts automatically. `memory_search({ searchIn: "concepts" })` is alias-aware. The tool does not silently merge ambiguous semantic near-duplicates; it only returns advisory duplicate hints in tool details.
 
-Memory writes store ISO `created`/`updated` timestamps so same-day records can still sort by write time.
+Memory writes store ISO `created`/`updated` timestamps so same-day records can still sort by write time. Explicit `memory_delete` removes one record, updates `.catalog.json`, and reconciles `.concepts.json` by preserving aliases and active alias targets while dropping unreferenced concepts.
 
 ## Legacy migration
 

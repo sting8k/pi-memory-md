@@ -42,7 +42,7 @@ Prefer one topic or result per file.
 
 ## Writing
 
-Use `memory_write` for both create and full replacement. Prefer structured semantic fields over long prose: `summary`, `concepts`, `claims`, `facts`, `relations`, and optional `notes`. For ergonomics, pass logical paths under `state/` or `events/`; new writes are stored as identity-addressed `records/<stable-id>.md` files.
+Use `memory_write` for both create and full replacement. Prefer structured semantic fields over long prose: `summary`, `concepts`, `claims`, `facts`, `relations`, and optional `notes`. For ergonomics, pass logical paths under `state/` or `events/`; new writes are stored as identity-addressed `records/<stable-id>.md` files. Generated Markdown does not repeat summary, concepts, or claims in the body; read projections render them from frontmatter.
 
 ```text
 memory_write({
@@ -85,7 +85,7 @@ Views:
 - `knowledge`: summary, concepts, claims, facts, relations;
 - `full`: full Markdown including optional notes/prose.
 
-Use `memory_list` for metadata and `memory_search` for on-demand retrieval. `memory_search({ searchIn: "concepts" })` is alias-aware. Session injection contains metadata for only the 10 most recently updated memories, not full content.
+Use `memory_list` for metadata and `memory_search` for on-demand retrieval. `memory_search({ searchIn: "concepts" })` is alias-aware. Session injection contains metadata for only the 10 most recently updated memories, not full content. `.catalog.json` is a rebuildable slim metadata index, not a second copy of full Markdown.
 
 ## Frontmatter
 
@@ -96,8 +96,12 @@ Managed fields are:
 - `concepts`: retrieval concepts;
 - `claims`: decisions or conclusions;
 - `tags`: optional labels;
-- `created`: creation date;
-- `updated`: last meaningful update date.
+- `created`: ISO creation timestamp;
+- `updated`: ISO timestamp for the last meaningful update.
+
+## Cleanup
+
+Use `memory_delete({ path: "@event.foo" })` only for explicit destructive cleanup. It deletes the record, updates the slim catalog, and reconciles `.concepts.json` while preserving aliases and alias targets.
 
 ## Optional facts
 

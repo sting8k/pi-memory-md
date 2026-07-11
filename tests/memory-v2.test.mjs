@@ -8,6 +8,7 @@ import {
   buildMemoryContext,
   buildStructuredMemoryContent,
   createMemoryId,
+  deleteMemoryFile,
   findMemoryFileById,
   formatMemoryRead,
   getConceptDictionary,
@@ -30,7 +31,7 @@ import {
   writeMemoryFile,
 } from "../.test-dist/memoryMdCore.js";
 import { searchMemoryFiles } from "../.test-dist/search-engine.js";
-import { registerMemorySearch, registerMemoryWrite } from "../.test-dist/tools.js";
+import { registerMemoryDelete, registerMemorySearch, registerMemoryWrite } from "../.test-dist/tools.js";
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-v2-"));
@@ -334,6 +335,60 @@ test("memory tools normalize concepts transparently", async () => {
   }
 });
 
+test("memory delete removes records and reconciles derived metadata", async () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const memoryDir = getMemoryDir(settings, workspace);
+    fs.mkdirSync(memoryDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(memoryDir, ".concepts.json"),
+      `${JSON.stringify(
+        {
+          version: 1,
+          concepts: ["alias-target", "kept-concept", "temporary-cleanup-concept", "unused-concept"],
+          aliases: { "legacy-cleanup": "alias-target" },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+    const keptTarget = resolveMemoryWriteTarget(memoryDir, "events/kept.md", "event");
+    writeMemoryFile(keptTarget.filePath, "# Kept", {
+      description: "Kept",
+      concepts: ["kept-concept"],
+      tags: [],
+    });
+    upsertMemoryCatalog(memoryDir, keptTarget.filePath);
+
+    const deleteTarget = resolveMemoryWriteTarget(memoryDir, "events/delete-me.md", "event");
+    writeMemoryFile(deleteTarget.filePath, "# Delete me", {
+      description: "Delete me",
+      concepts: ["temporary-cleanup-concept"],
+      tags: [],
+    });
+    upsertMemoryCatalog(memoryDir, deleteTarget.filePath);
+
+    const deleted = deleteMemoryFile(memoryDir, "@event.delete-me");
+    assert.equal(deleted.id, "event.delete-me");
+    assert.equal(fs.existsSync(deleteTarget.filePath), false);
+    assert.deepEqual(
+      getMemoryCatalog(memoryDir).map((entry) => entry.id),
+      ["event.kept"],
+    );
+
+    const dictionary = getConceptDictionary(memoryDir);
+    assert.deepEqual(dictionary.aliases, { "legacy-cleanup": "alias-target" });
+    assert.deepEqual(dictionary.concepts, ["alias-target", "kept-concept"]);
+
+    const { pi, tools } = fakePi();
+    registerMemoryDelete(pi, settings);
+    assert.equal(tools.has("memory_delete"), true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("structured memory records support compact semantic read and search", () => {
   const { root, workspace, settings } = fixture();
   try {
@@ -369,7 +424,12 @@ test("structured memory records support compact semantic read and search", () =>
     const catalogEntry = getMemoryCatalog(memoryDir).at(0);
     assert.equal(catalogEntry.summary, "V3 optimizes semantic memory reads with compact projections");
     assert.deepEqual(catalogEntry.concepts, ["identity-addressed records", "semantic projection"]);
-    assert.equal(catalogEntry.facts["benchmark.v3.write_ms"], 0.269);
+    assert.equal("content" in catalogEntry, false);
+    assert.equal("facts" in catalogEntry, false);
+    assert.equal("relations" in catalogEntry, false);
+    assert.doesNotMatch(content, /^## Summary$/m);
+    assert.doesNotMatch(content, /^## Concepts$/m);
+    assert.doesNotMatch(content, /^## Claims$/m);
 
     const knowledge = formatMemoryRead(memory, "knowledge");
     assert.match(knowledge, /## Facts/);

@@ -616,7 +616,7 @@ export const MEMORY_FACTS_END = "<!-- /memory:facts -->";
 const MEMORY_KEY_PATTERN = /^[a-z][a-z0-9_.-]*$/;
 const MEMORY_RECORDS_DIR = "records";
 const MEMORY_CATALOG_FILE = ".catalog.json";
-const MEMORY_CATALOG_VERSION = 2;
+const MEMORY_CATALOG_VERSION = 3;
 const CONCEPT_DICTIONARY_FILE = ".concepts.json";
 
 export interface MemoryCatalogEntry {
@@ -628,13 +628,10 @@ export interface MemoryCatalogEntry {
   concepts: string[];
   claims: string[];
   tags: string[];
-  facts: Record<string, MemoryFactValue>;
-  relations: Record<string, string>;
   created?: string;
   updated?: string;
   mtimeMs: number;
   size: number;
-  content: string;
 }
 
 interface MemoryCatalog {
@@ -939,10 +936,6 @@ function normalizeRelationKey(key: string): string {
 
 export function buildStructuredMemoryContent(fields: StructuredMemoryFields & { description: string }): string {
   const lines: string[] = [`# ${fields.summary ?? fields.description}`];
-
-  if (fields.summary) lines.push("", "## Summary", fields.summary);
-  if (fields.concepts?.length) lines.push("", "## Concepts", ...fields.concepts.map((concept) => `- ${concept}`));
-  if (fields.claims?.length) lines.push("", "## Claims", ...fields.claims.map((claim) => `- ${claim}`));
 
   const factLines = [
     ...Object.entries(fields.facts ?? {}).map(([key, value]) => `${key} = ${JSON.stringify(value)}`),
@@ -1260,7 +1253,6 @@ function catalogEntryFromMemory(memoryDir: string, filePath: string): MemoryCata
   const memory = readMemoryFile(filePath);
   if (!memory?.frontmatter.id || !memory.frontmatter.kind) return null;
   const stats = fs.statSync(filePath);
-  const semantic = parseMemoryFacts(memory.content);
   return {
     path: path.relative(memoryDir, filePath),
     id: memory.frontmatter.id,
@@ -1270,32 +1262,18 @@ function catalogEntryFromMemory(memoryDir: string, filePath: string): MemoryCata
     concepts: memory.frontmatter.concepts ?? [],
     claims: memory.frontmatter.claims ?? [],
     tags: memory.frontmatter.tags ?? [],
-    facts: semantic.facts,
-    relations: semantic.relations,
     created: memory.frontmatter.created,
     updated: memory.frontmatter.updated,
     mtimeMs: stats.mtimeMs,
     size: stats.size,
-    content: memory.content,
   };
 }
 
 function memoryFromCatalogEntry(memoryDir: string, entry: MemoryCatalogEntry) {
-  return {
-    path: path.join(memoryDir, entry.path),
-    frontmatter: {
-      id: entry.id,
-      kind: entry.kind,
-      description: entry.description,
-      summary: entry.summary,
-      concepts: entry.concepts,
-      claims: entry.claims,
-      tags: entry.tags,
-      created: entry.created,
-      updated: entry.updated,
-    },
-    content: entry.content,
-  };
+  const filePath = path.join(memoryDir, entry.path);
+  const memory = readMemoryFile(filePath);
+  if (!memory) throw new Error(`Memory catalog entry points to an unreadable file: ${entry.path}`);
+  return memory;
 }
 
 function readMemoryCatalog(memoryDir: string): MemoryCatalog | null {
@@ -1348,9 +1326,9 @@ export function getMemoryCatalog(memoryDir: string): MemoryCatalogEntry[] {
 export function upsertMemoryCatalog(memoryDir: string, filePath: string): void {
   const entry = catalogEntryFromMemory(memoryDir, filePath);
   if (!entry) return;
-  const catalog = readMemoryCatalog(memoryDir);
-  const entries =
-    catalog?.entries.filter((candidate) => candidate.path !== entry.path && candidate.id !== entry.id) ?? [];
+  const entries = getMemoryCatalog(memoryDir).filter(
+    (candidate) => candidate.path !== entry.path && candidate.id !== entry.id,
+  );
   entries.push(entry);
   entries.sort((a, b) => a.path.localeCompare(b.path));
   writeMemoryCatalog(memoryDir, entries);
@@ -1358,6 +1336,49 @@ export function upsertMemoryCatalog(memoryDir: string, filePath: string): void {
 
 export function memoryFileFromCatalogEntry(memoryDir: string, entry: MemoryCatalogEntry) {
   return memoryFromCatalogEntry(memoryDir, entry);
+}
+
+export function removeMemoryCatalogEntry(memoryDir: string, filePath: string): void {
+  const relPath = path.relative(memoryDir, filePath);
+  const entries = getMemoryCatalog(memoryDir).filter((entry) => entry.path !== relPath);
+  writeMemoryCatalog(memoryDir, entries);
+}
+
+export function reconcileConceptDictionary(memoryDir: string): ConceptDictionary {
+  const existing = getConceptDictionary(memoryDir);
+  const concepts = new Set<string>(
+    Object.values(existing.aliases)
+      .map((target) => normalizeConceptLabel(target))
+      .filter(Boolean),
+  );
+  for (const filePath of listMemoryFiles(memoryDir)) {
+    const memory = readMemoryFile(filePath);
+    for (const concept of memory?.frontmatter.concepts ?? []) {
+      const normalized = normalizeConceptLabel(concept);
+      if (normalized) concepts.add(normalized);
+    }
+  }
+
+  const dictionary: ConceptDictionary = {
+    version: 1,
+    concepts: uniqueSorted(concepts),
+    aliases: existing.aliases,
+  };
+  writeConceptDictionary(memoryDir, dictionary);
+  return dictionary;
+}
+
+export function deleteMemoryFile(
+  memoryDir: string,
+  pathOrId: string,
+): { id: string; path: string; dictionary: ConceptDictionary } {
+  const filePath = resolveMemoryFile(memoryDir, pathOrId);
+  const memory = readMemoryFile(filePath);
+  if (!memory?.frontmatter.id || !memory.frontmatter.kind) throw new Error(`Memory file not found: ${pathOrId}`);
+  fs.rmSync(filePath, { force: true });
+  removeMemoryCatalogEntry(memoryDir, filePath);
+  const dictionary = reconcileConceptDictionary(memoryDir);
+  return { id: memory.frontmatter.id, path: path.relative(memoryDir, filePath), dictionary };
 }
 /**
  * Memory context
