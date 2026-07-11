@@ -3,7 +3,17 @@ import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { parseFrontmatter, stringifyFrontmatter } from "./frontmatter.js";
-import type { GitResult, MemoryFrontmatter, MemoryKind, MemoryMdSettings, ParsedFrontmatter } from "./types.js";
+import type {
+  GitResult,
+  MemoryFactValue,
+  MemoryFile,
+  MemoryFrontmatter,
+  MemoryKind,
+  MemoryMdSettings,
+  MemoryReadView,
+  ParsedFrontmatter,
+  StructuredMemoryFields,
+} from "./types.js";
 
 export * from "./types.js";
 
@@ -610,14 +620,19 @@ export const MEMORY_FACTS_END = "<!-- /memory:facts -->";
 const MEMORY_KEY_PATTERN = /^[a-z][a-z0-9_.-]*$/;
 const MEMORY_RECORDS_DIR = "records";
 const MEMORY_CATALOG_FILE = ".catalog.json";
-const MEMORY_CATALOG_VERSION = 1;
+const MEMORY_CATALOG_VERSION = 2;
 
 export interface MemoryCatalogEntry {
   path: string;
   id: string;
   kind: MemoryKind;
   description: string;
+  summary?: string;
+  concepts: string[];
+  claims: string[];
   tags: string[];
+  facts: Record<string, MemoryFactValue>;
+  relations: Record<string, string>;
   created?: string;
   updated?: string;
   mtimeMs: number;
@@ -654,6 +669,137 @@ function catalogPath(memoryDir: string): string {
   return path.join(memoryDir, MEMORY_CATALOG_FILE);
 }
 
+function isMemoryFactValue(value: unknown): value is MemoryFactValue {
+  if (value === null) return true;
+  if (["string", "number", "boolean"].includes(typeof value)) return true;
+  return (
+    Array.isArray(value) &&
+    value.every((entry) => entry === null || ["string", "number", "boolean"].includes(typeof entry))
+  );
+}
+
+export function parseMemoryFacts(content: string): {
+  facts: Record<string, MemoryFactValue>;
+  relations: Record<string, string>;
+} {
+  const startCount = content.split(MEMORY_FACTS_START).length - 1;
+  const endCount = content.split(MEMORY_FACTS_END).length - 1;
+
+  if (startCount === 0 && endCount === 0) return { facts: {}, relations: {} };
+  if (startCount !== 1 || endCount !== 1) {
+    throw new Error("Memory content must contain exactly one complete facts block");
+  }
+
+  const start = content.indexOf(MEMORY_FACTS_START) + MEMORY_FACTS_START.length;
+  const end = content.indexOf(MEMORY_FACTS_END);
+  if (end < start) throw new Error("Memory facts end marker must follow the start marker");
+
+  const facts: Record<string, MemoryFactValue> = {};
+  const relations: Record<string, string> = {};
+  const keys = new Set<string>();
+
+  for (const rawLine of content.slice(start, end).split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    const relation = line.match(/^([a-z][a-z0-9_.-]*)\s*->\s*@([a-z][a-z0-9_.-]*)$/);
+    if (relation) {
+      if (keys.has(relation[1])) throw new Error(`Duplicate memory fact key: ${relation[1]}`);
+      keys.add(relation[1]);
+      relations[relation[1]] = `@${relation[2]}`;
+      continue;
+    }
+
+    const assignment = line.match(/^([a-z][a-z0-9_.-]*)\s*=\s*(.+)$/);
+    if (!assignment || !MEMORY_KEY_PATTERN.test(assignment[1])) {
+      throw new Error(`Invalid memory fact line: ${line}`);
+    }
+
+    let value: unknown;
+    try {
+      value = JSON.parse(assignment[2]);
+    } catch {
+      throw new Error(`Memory fact value must be valid JSON: ${assignment[1]}`);
+    }
+    if (!isMemoryFactValue(value)) throw new Error(`Memory fact values cannot be objects: ${assignment[1]}`);
+    if (keys.has(assignment[1])) throw new Error(`Duplicate memory fact key: ${assignment[1]}`);
+    keys.add(assignment[1]);
+    facts[assignment[1]] = value;
+  }
+
+  return { facts, relations };
+}
+
+function normalizeRelationKey(key: string): string {
+  return key.startsWith("relation.") ? key : `relation.${key}`;
+}
+
+export function buildStructuredMemoryContent(fields: StructuredMemoryFields & { description: string }): string {
+  const lines: string[] = [`# ${fields.summary ?? fields.description}`];
+
+  if (fields.summary) lines.push("", "## Summary", fields.summary);
+  if (fields.concepts?.length) lines.push("", "## Concepts", ...fields.concepts.map((concept) => `- ${concept}`));
+  if (fields.claims?.length) lines.push("", "## Claims", ...fields.claims.map((claim) => `- ${claim}`));
+
+  const factLines = [
+    ...Object.entries(fields.facts ?? {}).map(([key, value]) => `${key} = ${JSON.stringify(value)}`),
+    ...Object.entries(fields.relations ?? {}).map(
+      ([key, target]) => `${normalizeRelationKey(key)} -> ${target.startsWith("@") ? target : `@${target}`}`,
+    ),
+  ];
+  if (factLines.length) lines.push("", MEMORY_FACTS_START, ...factLines, MEMORY_FACTS_END);
+  if (fields.notes) lines.push("", "## Notes", fields.notes);
+
+  return `${lines.join("\n")}\n`;
+}
+
+function pushListSection(lines: string[], title: string, values?: string[]): void {
+  if (!values?.length) return;
+  lines.push("", `## ${title}`, ...values.map((value) => `- ${value}`));
+}
+
+function pushMapSection(lines: string[], title: string, values: Record<string, unknown>, separator: string): void {
+  const entries = Object.entries(values);
+  if (entries.length === 0) return;
+  lines.push(
+    "",
+    `## ${title}`,
+    ...entries.map(
+      ([key, value]) => `- ${key} ${separator} ${typeof value === "string" ? value : JSON.stringify(value)}`,
+    ),
+  );
+}
+
+export function formatMemoryRead(memory: MemoryFile, view: MemoryReadView = "full"): string {
+  const {
+    id,
+    kind,
+    description = "No description",
+    tags = [],
+    summary,
+    concepts = [],
+    claims = [],
+  } = memory.frontmatter;
+  const semantic = parseMemoryFacts(memory.content);
+  const lines = [
+    `# ${description}`,
+    "",
+    `ID: ${id ? `@${id}` : "none"}`,
+    `Kind: ${kind ?? "legacy"}`,
+    `Tags: ${tags.join(", ") || "none"}`,
+  ];
+  if (view === "full") return [...lines, "", memory.content].join("\n");
+
+  if (summary) lines.push("", "## Summary", summary);
+  pushListSection(lines, "Concepts", concepts);
+
+  if (view === "summary") return `${lines.join("\n")}\n`;
+
+  pushListSection(lines, "Claims", claims);
+  pushMapSection(lines, "Facts", semantic.facts, "=");
+  pushMapSection(lines, "Relations", semantic.relations, "->");
+  return `${lines.join("\n")}\n`;
+}
 function recordInfoFromFilePath(filePath: string): { id: string; kind: MemoryKind } | null {
   const parts = path.normalize(filePath).split(path.sep);
   const recordIndex = parts.lastIndexOf(MEMORY_RECORDS_DIR);
@@ -669,49 +815,12 @@ function recordInfoFromFilePath(filePath: string): { id: string; kind: MemoryKin
 }
 
 export function validateMemoryContent(content: string): { valid: boolean; error?: string } {
-  const startCount = content.split(MEMORY_FACTS_START).length - 1;
-  const endCount = content.split(MEMORY_FACTS_END).length - 1;
-
-  if (startCount === 0 && endCount === 0) return { valid: true };
-  if (startCount !== 1 || endCount !== 1) {
-    return { valid: false, error: "Memory content must contain exactly one complete facts block" };
+  try {
+    parseMemoryFacts(content);
+    return { valid: true };
+  } catch (error) {
+    return { valid: false, error: (error as Error).message };
   }
-
-  const start = content.indexOf(MEMORY_FACTS_START) + MEMORY_FACTS_START.length;
-  const end = content.indexOf(MEMORY_FACTS_END);
-  if (end < start) return { valid: false, error: "Memory facts end marker must follow the start marker" };
-
-  const keys = new Set<string>();
-  for (const rawLine of content.slice(start, end).split("\n")) {
-    const line = rawLine.trim();
-    if (!line) continue;
-
-    const relation = line.match(/^([a-z][a-z0-9_.-]*)\s*->\s*@([a-z][a-z0-9_.-]*)$/);
-    if (relation) {
-      if (keys.has(relation[1])) return { valid: false, error: `Duplicate memory fact key: ${relation[1]}` };
-      keys.add(relation[1]);
-      continue;
-    }
-
-    const assignment = line.match(/^([a-z][a-z0-9_.-]*)\s*=\s*(.+)$/);
-    if (!assignment || !MEMORY_KEY_PATTERN.test(assignment[1])) {
-      return { valid: false, error: `Invalid memory fact line: ${line}` };
-    }
-
-    try {
-      const value = JSON.parse(assignment[2]);
-      if (value !== null && typeof value === "object" && !Array.isArray(value)) {
-        return { valid: false, error: `Memory fact values cannot be objects: ${assignment[1]}` };
-      }
-    } catch {
-      return { valid: false, error: `Memory fact value must be valid JSON: ${assignment[1]}` };
-    }
-
-    if (keys.has(assignment[1])) return { valid: false, error: `Duplicate memory fact key: ${assignment[1]}` };
-    keys.add(assignment[1]);
-  }
-
-  return { valid: true };
 }
 
 function validateFrontmatter(data: ParsedFrontmatter): { valid: boolean; error?: string } {
@@ -736,12 +845,19 @@ function validateFrontmatter(data: ParsedFrontmatter): { valid: boolean; error?:
     return { valid: false, error: "'description' must be a string if provided" };
   }
 
+  if (frontmatter.summary !== undefined && typeof frontmatter.summary !== "string") {
+    return { valid: false, error: "'summary' must be a string if provided" };
+  }
+
   if (frontmatter.limit !== undefined && (typeof frontmatter.limit !== "number" || frontmatter.limit <= 0)) {
     return { valid: false, error: "'limit' must be a positive number" };
   }
 
-  if (frontmatter.tags !== undefined && !Array.isArray(frontmatter.tags)) {
-    return { valid: false, error: "'tags' must be an array of strings" };
+  for (const field of ["tags", "concepts", "claims"] as const) {
+    const value = frontmatter[field];
+    if (value !== undefined && (!Array.isArray(value) || value.some((entry) => typeof entry !== "string"))) {
+      return { valid: false, error: `'${field}' must be an array of strings` };
+    }
   }
 
   return { valid: true };
@@ -941,12 +1057,18 @@ function catalogEntryFromMemory(memoryDir: string, filePath: string): MemoryCata
   const memory = readMemoryFile(filePath);
   if (!memory?.frontmatter.id || !memory.frontmatter.kind) return null;
   const stats = fs.statSync(filePath);
+  const semantic = parseMemoryFacts(memory.content);
   return {
     path: path.relative(memoryDir, filePath),
     id: memory.frontmatter.id,
     kind: memory.frontmatter.kind,
     description: memory.frontmatter.description ?? "No description",
+    summary: memory.frontmatter.summary,
+    concepts: memory.frontmatter.concepts ?? [],
+    claims: memory.frontmatter.claims ?? [],
     tags: memory.frontmatter.tags ?? [],
+    facts: semantic.facts,
+    relations: semantic.relations,
     created: memory.frontmatter.created,
     updated: memory.frontmatter.updated,
     mtimeMs: stats.mtimeMs,
@@ -962,6 +1084,9 @@ function memoryFromCatalogEntry(memoryDir: string, entry: MemoryCatalogEntry) {
       id: entry.id,
       kind: entry.kind,
       description: entry.description,
+      summary: entry.summary,
+      concepts: entry.concepts,
+      claims: entry.claims,
       tags: entry.tags,
       created: entry.created,
       updated: entry.updated,

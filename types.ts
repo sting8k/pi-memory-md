@@ -5,11 +5,26 @@ import type { FrontmatterData } from "./frontmatter.js";
  */
 
 export type MemoryKind = "state" | "event";
+export type MemoryReadView = "full" | "summary" | "knowledge";
+
+export type MemoryFactValue = string | number | boolean | null | Array<string | number | boolean | null>;
+
+export interface StructuredMemoryFields {
+  summary?: string;
+  concepts?: string[];
+  claims?: string[];
+  facts?: Record<string, MemoryFactValue>;
+  relations?: Record<string, string>;
+  notes?: string;
+}
 
 export interface MemoryFrontmatter {
   id?: string;
   kind?: MemoryKind;
   description: string;
+  summary?: string;
+  concepts?: string[];
+  claims?: string[];
   limit?: number;
   tags?: string[];
   created?: string;

@@ -41,15 +41,20 @@ Prefer one topic or result per file.
 
 ## Writing
 
-Use `memory_write` for both create and full replacement. For ergonomics, pass logical paths under `state/` or `events/`; new writes are stored as identity-addressed `records/<stable-id>.md` files.
+Use `memory_write` for both create and full replacement. Prefer structured semantic fields over long prose: `summary`, `concepts`, `claims`, `facts`, `relations`, and optional `notes`. For ergonomics, pass logical paths under `state/` or `events/`; new writes are stored as identity-addressed `records/<stable-id>.md` files.
 
 ```text
 memory_write({
   path: "events/local-extension-investigation.md",
   kind: "event",
   description: "Why local extension loading failed",
-  tags: ["runtime", "extension"],
-  content: "# Investigation\n\n..."
+  summary: "Local extension loading failed because the runtime used a different package resolution path.",
+  concepts: ["local extension loading", "runtime package resolution"],
+  claims: ["Local-path loading should not require this repo's node_modules"],
+  facts: { "runtime.local_path_requires_install": false },
+  relations: { "evidence": "@event.local-extension-investigation" },
+  notes: "Optional evidence/prose only when needed.",
+  tags: ["runtime", "extension"]
 })
 ```
 
@@ -63,11 +68,17 @@ Read by path:
 memory_read({ path: "state/preferences.md" })
 ```
 
-Or by stable ID:
+Or by stable ID with compact semantic projection:
 
 ```text
-memory_read({ path: "@state.preferences" })
+memory_read({ path: "@state.preferences", view: "knowledge" })
 ```
+
+Views:
+
+- `summary`: metadata, summary, concepts;
+- `knowledge`: summary, concepts, claims, facts, relations;
+- `full`: full Markdown including optional notes/prose.
 
 Use `memory_list` for metadata and `memory_search` for on-demand retrieval. Session injection contains metadata for only the 10 most recently updated memories, not full content.
 
@@ -76,13 +87,16 @@ Use `memory_list` for metadata and `memory_search` for on-demand retrieval. Sess
 Managed fields are:
 
 - `description`: concise retrieval summary;
+- `summary`: one-sentence semantic gist;
+- `concepts`: retrieval concepts;
+- `claims`: decisions or conclusions;
 - `tags`: optional labels;
 - `created`: creation date;
 - `updated`: last meaningful update date.
 
 ## Optional facts
 
-Use a fact block only when precise machine-readable claims improve retrieval or verification:
+Structured `facts` and `relations` are rendered into a fact block. Use them when precise machine-readable claims improve retrieval or verification:
 
 ```markdown
 <!-- memory:facts:v1 -->

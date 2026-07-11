@@ -6,13 +6,17 @@ import test from "node:test";
 import { parseFrontmatter, stringifyFrontmatter } from "../.test-dist/frontmatter.js";
 import {
   buildMemoryContext,
+  buildStructuredMemoryContent,
   createMemoryId,
   findMemoryFileById,
+  formatMemoryRead,
   getMemoryCatalog,
   getMemoryDir,
   MEMORY_FACTS_END,
   MEMORY_FACTS_START,
+  memoryFileFromCatalogEntry,
   migrateMemoryProject,
+  parseMemoryFacts,
   readMemoryFile,
   resolveMemoryPath,
   resolveMemoryWriteTarget,
@@ -21,6 +25,7 @@ import {
   validateMemoryContent,
   writeMemoryFile,
 } from "../.test-dist/memoryMdCore.js";
+import { searchMemoryFiles } from "../.test-dist/search-engine.js";
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-v2-"));
@@ -166,6 +171,114 @@ test("facts DSL accepts JSON values and stable relations", () => {
 
   const invalid = `${MEMORY_FACTS_START}\nruntime.vram = 24 GiB\n${MEMORY_FACTS_END}`;
   assert.match(validateMemoryContent(invalid).error ?? "", /valid JSON/);
+});
+
+test("structured memory records support compact semantic read and search", () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const memoryDir = getMemoryDir(settings, workspace);
+    const target = resolveMemoryWriteTarget(memoryDir, "events/structured-benchmark.md", "event");
+    const content = buildStructuredMemoryContent({
+      description: "Structured benchmark",
+      summary: "V3 optimizes semantic memory reads with compact projections",
+      concepts: ["identity-addressed records", "semantic projection"],
+      claims: ["Structured records avoid loading prose when facts are enough"],
+      facts: { "benchmark.v3.write_ms": 0.269, "benchmark.sizes": [50, 1000, 10000] },
+      relations: { implementation: "@event.memory-v3" },
+      notes: "Evidence prose stays optional and should not appear in knowledge view.",
+    });
+
+    assert.deepEqual(validateMemoryContent(content), { valid: true });
+    writeMemoryFile(target.filePath, content, {
+      description: "Structured benchmark",
+      summary: "V3 optimizes semantic memory reads with compact projections",
+      concepts: ["identity-addressed records", "semantic projection"],
+      claims: ["Structured records avoid loading prose when facts are enough"],
+      tags: ["memory-v4", "structured"],
+      created: "2026-07-11",
+      updated: "2026-07-11",
+    });
+    upsertMemoryCatalog(memoryDir, target.filePath);
+
+    const memory = readMemoryFile(target.filePath);
+    const semantic = parseMemoryFacts(memory.content);
+    assert.equal(semantic.facts["benchmark.v3.write_ms"], 0.269);
+    assert.equal(semantic.relations["relation.implementation"], "@event.memory-v3");
+
+    const catalogEntry = getMemoryCatalog(memoryDir).at(0);
+    assert.equal(catalogEntry.summary, "V3 optimizes semantic memory reads with compact projections");
+    assert.deepEqual(catalogEntry.concepts, ["identity-addressed records", "semantic projection"]);
+    assert.equal(catalogEntry.facts["benchmark.v3.write_ms"], 0.269);
+
+    const knowledge = formatMemoryRead(memory, "knowledge");
+    assert.match(knowledge, /## Facts/);
+    assert.match(knowledge, /benchmark\.v3\.write_ms = 0\.269/);
+    assert.doesNotMatch(knowledge, /Evidence prose/);
+
+    const summary = formatMemoryRead(memory, "summary");
+    assert.match(summary, /## Concepts/);
+    assert.doesNotMatch(summary, /## Claims/);
+
+    const hits = searchMemoryFiles({
+      files: new Map([[catalogEntry.path, memoryFileFromCatalogEntry(memoryDir, catalogEntry)]]),
+      query: "semantic projection",
+      searchIn: "concepts",
+    });
+    assert.equal(hits[0].path, path.join("records", "event.structured-benchmark.md"));
+    assert.deepEqual(hits[0].matchedIn, ["concepts"]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("search treats metric queries literally while preserving explicit regex", () => {
+  const files = new Map([
+    [
+      "records/event.benchmark.md",
+      {
+        path: "records/event.benchmark.md",
+        frontmatter: {
+          id: "event.benchmark",
+          kind: "event",
+          description: "Memory benchmark metrics",
+          tags: ["benchmark"],
+        },
+        content: [
+          "benchmark.v2.id_read_ms_10000 = 98.517",
+          "benchmark.v2.latest-10 = 149.367",
+          "benchmark.v3.catalog_lookup_ms_10000 = 0",
+          "failure occurred during build",
+        ].join("\n"),
+      },
+    ],
+    [
+      "records/event.decoy.md",
+      {
+        path: "records/event.decoy.md",
+        frontmatter: { id: "event.decoy", kind: "event", description: "Decoy", tags: [] },
+        content: "98x517 unrelated value",
+      },
+    ],
+  ]);
+
+  const metrics = searchMemoryFiles({
+    files,
+    query: "98.517 latest-10 catalog_lookup_ms_10000",
+    searchIn: "all",
+    kind: "event",
+  });
+  assert.equal(metrics[0].path, "records/event.benchmark.md");
+  assert.equal(metrics[0].matchCount, 3);
+  assert.equal(
+    metrics.some((hit) => hit.path === "records/event.decoy.md"),
+    false,
+  );
+
+  const regex = searchMemoryFiles({ files, query: "fail.*build", searchIn: "content" });
+  assert.deepEqual(
+    regex.map((hit) => hit.path),
+    ["records/event.benchmark.md"],
+  );
 });
 
 test("context injects only the ten most recently updated memories", () => {

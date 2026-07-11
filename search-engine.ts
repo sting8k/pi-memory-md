@@ -8,7 +8,7 @@ import type { MemoryFile } from "./types.js";
 
 // ── Types ──
 
-export type MatchedField = "content" | "tags" | "description" | "id" | "kind";
+export type MatchedField = "content" | "tags" | "description" | "summary" | "concepts" | "claims" | "id" | "kind";
 
 export interface SearchHit {
   path: string;
@@ -17,7 +17,7 @@ export interface SearchHit {
   matchedIn: MatchedField[];
 }
 
-export type SearchField = "content" | "tags" | "description" | "id" | "all";
+export type SearchField = "content" | "tags" | "description" | "summary" | "concepts" | "claims" | "id" | "all";
 
 const MAX_SEARCH_RESULTS = 10;
 const MAX_SNIPPET_CHARS = 500;
@@ -35,19 +35,12 @@ const safeRegex = (pattern: string): RegExp => {
   }
 };
 
-const looksLikeRegex = (query: string): boolean => /[|*+?{}()[\]\\^$.]/.test(query);
+const looksLikeRegex = (query: string): boolean =>
+  /[|^$[\]\\]/.test(query) || /\.\*|\.\+|\([^)]*\)|\{\d+(?:,\d*)?\}/.test(query);
 
-const snippetRegex = (terms: string[]): RegExp => {
-  const alts = terms.map((t) => {
-    try {
-      new RegExp(t, "i");
-      return t;
-    } catch {
-      return escapeRegex(t);
-    }
-  });
-  return new RegExp(alts.join("|"), "i");
-};
+const literalTermRegexes = (terms: string[]): RegExp[] => terms.map((term) => new RegExp(escapeRegex(term), "i"));
+
+const snippetRegex = (terms: string[]): RegExp => new RegExp(terms.map(escapeRegex).join("|"), "i");
 
 // ── Stopwords ──
 
@@ -148,10 +141,10 @@ const filterStopwords = (terms: string[]): string[] => {
 
 // ── Helpers ──
 
-const countMatches = (hay: string, terms: string[]): number => {
+const countMatches = (hay: string, termRegexes: RegExp[]): number => {
   let count = 0;
-  for (const t of terms) {
-    if (safeRegex(t).test(hay)) count++;
+  for (const regex of termRegexes) {
+    if (regex.test(hay)) count++;
   }
   return count;
 };
@@ -191,6 +184,12 @@ function buildSearchText(memory: MemoryFile, field: SearchField): string {
       return memory.frontmatter.tags?.join(" ") ?? "";
     case "description":
       return memory.frontmatter.description;
+    case "summary":
+      return memory.frontmatter.summary ?? "";
+    case "concepts":
+      return memory.frontmatter.concepts?.join("\n") ?? "";
+    case "claims":
+      return memory.frontmatter.claims?.join("\n") ?? "";
     case "id":
       return memory.frontmatter.id ?? "";
     case "all":
@@ -198,17 +197,25 @@ function buildSearchText(memory: MemoryFile, field: SearchField): string {
         memory.frontmatter.id ?? "",
         memory.frontmatter.kind ?? "",
         memory.frontmatter.description,
+        memory.frontmatter.summary ?? "",
+        memory.frontmatter.concepts?.join("\n") ?? "",
+        memory.frontmatter.claims?.join("\n") ?? "",
         memory.frontmatter.tags?.join(" ") ?? "",
         memory.content,
       ].join("\n");
   }
 }
 
-function detectMatchedFields(memory: MemoryFile, regex: RegExp): MatchedField[] {
+function detectMatchedFields(memory: MemoryFile, regex: RegExp, searchIn: SearchField): MatchedField[] {
+  if (searchIn !== "all") return regex.test(buildSearchText(memory, searchIn)) ? [searchIn] : [];
+
   const fields: MatchedField[] = [];
   if (regex.test(memory.content)) fields.push("content");
   if (memory.frontmatter.tags?.some((t) => regex.test(t))) fields.push("tags");
   if (regex.test(memory.frontmatter.description)) fields.push("description");
+  if (memory.frontmatter.summary && regex.test(memory.frontmatter.summary)) fields.push("summary");
+  if (memory.frontmatter.concepts?.some((concept) => regex.test(concept))) fields.push("concepts");
+  if (memory.frontmatter.claims?.some((claim) => regex.test(claim))) fields.push("claims");
   if (memory.frontmatter.id && regex.test(memory.frontmatter.id)) fields.push("id");
   if (memory.frontmatter.kind && regex.test(memory.frontmatter.kind)) fields.push("kind");
   return fields;
@@ -218,14 +225,23 @@ function buildSnippet(memory: MemoryFile, searchIn: SearchField, regex: RegExp):
   const tags = memory.frontmatter.tags?.join(", ") ?? "";
   const tagSnippet = () => truncateSnippet(`Tags: ${tags}`);
   const descriptionSnippet = () => truncateSnippet(memory.frontmatter.description);
+  const summarySnippet = () => truncateSnippet(memory.frontmatter.summary ?? "");
+  const conceptsSnippet = () => truncateSnippet(`Concepts: ${memory.frontmatter.concepts?.join(", ") ?? ""}`);
+  const claimsSnippet = () => truncateSnippet((memory.frontmatter.claims ?? []).join("\n"));
 
   if (searchIn === "tags") return tagSnippet();
   if (searchIn === "description") return descriptionSnippet();
+  if (searchIn === "summary") return summarySnippet();
+  if (searchIn === "concepts") return conceptsSnippet();
+  if (searchIn === "claims") return claimsSnippet();
   if (searchIn === "id") return truncateSnippet(`ID: ${memory.frontmatter.id ?? "none"}`);
   if (searchIn === "all") {
-    if (regex.test(memory.content)) return lineSnippet(memory.content, regex);
+    if (memory.frontmatter.summary && regex.test(memory.frontmatter.summary)) return summarySnippet();
+    if (memory.frontmatter.concepts?.some((concept) => regex.test(concept))) return conceptsSnippet();
+    if (memory.frontmatter.claims?.some((claim) => regex.test(claim))) return claimsSnippet();
     if (memory.frontmatter.tags?.some((tag) => regex.test(tag))) return tagSnippet();
     if (regex.test(memory.frontmatter.description)) return descriptionSnippet();
+    if (regex.test(memory.content)) return lineSnippet(memory.content, regex);
     if (memory.frontmatter.id && regex.test(memory.frontmatter.id)) {
       return truncateSnippet(`ID: ${memory.frontmatter.id}`);
     }
@@ -265,7 +281,7 @@ export function searchMemoryFiles(input: SearchInput): SearchHit[] {
         path: relPath,
         snippet: buildSnippet(memory, searchIn, regex),
         matchCount: 1,
-        matchedIn: detectMatchedFields(memory, regex),
+        matchedIn: detectMatchedFields(memory, regex, searchIn),
       });
     }
 
@@ -274,12 +290,13 @@ export function searchMemoryFiles(input: SearchInput): SearchHit[] {
 
   // Natural language mode: OR match, sorted by matchCount desc
   const terms = filterStopwords(rawQuery.split(/\s+/));
+  const termRegexes = literalTermRegexes(terms);
   const snipRe = snippetRegex(terms);
 
   const hits: Array<{ hit: SearchHit; mc: number }> = [];
   for (const [relPath, memory] of entries) {
     const text = buildSearchText(memory, searchIn);
-    const mc = countMatches(text, terms);
+    const mc = countMatches(text, termRegexes);
     if (mc === 0) continue;
 
     hits.push({
@@ -287,7 +304,7 @@ export function searchMemoryFiles(input: SearchInput): SearchHit[] {
         path: relPath,
         snippet: buildSnippet(memory, searchIn, snipRe),
         matchCount: mc,
-        matchedIn: detectMatchedFields(memory, snipRe),
+        matchedIn: detectMatchedFields(memory, snipRe, searchIn),
       },
       mc,
     });

@@ -39,14 +39,14 @@ Each Git workspace gets an isolated project directory derived from its Git root 
 - New writes are identity-addressed records. For ergonomic calls, `memory_write(path="events/foo.md", kind="event", ...)` writes `records/event.foo.md`.
 - `.catalog.json` is a rebuildable local catalog used for fast `@id` lookup, listing, latest-memory context, and search.
 - The extension injects metadata for only the 10 most recently updated catalog entries.
-- Full Markdown content is loaded on demand with `memory_read` or `memory_search`.
+- Full Markdown content is loaded on demand with `memory_read(view="full")`; compact semantic projections use `view="summary"` or `view="knowledge"`.
 
 ## Tools
 
 | Tool | Purpose |
 |---|---|
-| `memory_read` | Read a file by relative path or stable `@id` |
-| `memory_write` | Create or fully replace one memory file |
+| `memory_read` | Read by relative path or stable `@id`, with `full`, `summary`, or `knowledge` projections |
+| `memory_write` | Create or fully replace one memory file, preferably from structured semantic fields |
 | `memory_list` | List project memory metadata |
 | `memory_search` | Search content or metadata, optionally by kind |
 | `memory_init` | Initialize identity-addressed `records/` |
@@ -70,14 +70,35 @@ updated: "2026-07-11"
 ---
 # Runtime investigation
 
-Full Markdown report here.
+## Summary
+Concise finding here.
+
+## Concepts
+- core-concept
+
+## Claims
+- Important conclusion.
+
+<!-- memory:facts:v1 -->
+runtime.local_path_requires_install = false
+relation.evidence -> @event.runtime-investigation
+<!-- /memory:facts -->
 ```
 
 IDs can be used as `@event.runtime-investigation`. Legacy `state/` and `events/` files may still be read during compatibility, but new writes use `records/`.
 
-## Optional fact block
+## Structured-first records
 
-A memory may include one machine-checkable fact block. Markdown outside it stays unrestricted.
+Prefer structured semantic fields over long prose. `memory_write` can generate compact Markdown from:
+
+- `summary`: one-sentence gist;
+- `concepts`: retrieval concepts;
+- `claims`: decisions or conclusions;
+- `facts`: JSON scalar/array values rendered into the facts block;
+- `relations`: stable `@id` links rendered as relation facts;
+- `notes`: optional evidence/prose loaded only in full view.
+
+A memory may still include one machine-checkable fact block. Markdown outside it stays unrestricted for compatibility.
 
 ```markdown
 <!-- memory:facts:v1 -->
@@ -87,7 +108,7 @@ relation.follow_up -> @event.next-investigation
 <!-- /memory:facts -->
 ```
 
-Fact values must be JSON scalars or arrays. Relations must point to a valid stable `@id`.
+Fact values must be JSON scalars or arrays. Relations must point to a valid stable `@id`. Use `memory_read({ path: "@event.foo", view: "knowledge" })` to retrieve summary, concepts, claims, facts, and relations without optional notes/prose.
 
 ## Legacy migration
 

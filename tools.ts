@@ -5,8 +5,10 @@ import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import {
+  buildStructuredMemoryContent,
   createDefaultFiles,
   ensureDirectoryStructure,
+  formatMemoryRead,
   getCurrentDate,
   getMemoryCatalog,
   getMemoryDir,
@@ -24,7 +26,7 @@ import {
   writeMemoryFile,
 } from "./memoryMdCore.js";
 import { type SearchField, searchMemoryFiles } from "./search-engine.js";
-import type { MemoryFrontmatter, MemoryMdSettings } from "./types.js";
+import type { MemoryFrontmatter, MemoryMdSettings, MemoryReadView, StructuredMemoryFields } from "./types.js";
 
 // Re-export types for convenience
 export type { ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
@@ -288,16 +290,22 @@ export function registerMemoryRead(pi: ExtensionAPI, settings: MemoryMdSettings)
   pi.registerTool({
     name: "memory_read",
     label: "Memory Read",
-    description: "Read a project memory file by relative path or stable @id",
+    description:
+      "Read a project memory file by relative path or stable @id with full, summary, or knowledge projection",
     parameters: Type.Object({
       path: Type.String({
         description:
           "Relative path (e.g. 'records/state.runtime.md' or logical 'state/runtime.md') or stable ID (e.g. '@state.runtime')",
       }),
+      view: Type.Optional(
+        Type.Union([Type.Literal("full"), Type.Literal("summary"), Type.Literal("knowledge")], {
+          description: "Projection to return: full Markdown, compact summary, or semantic knowledge only",
+        }),
+      ),
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const { path: pathOrId } = params as { path: string };
+      const { path: pathOrId, view = "full" } = params as { path: string; view?: MemoryReadView };
       const memoryDir = getMemoryDir(settings, ctx.cwd);
 
       try {
@@ -305,15 +313,9 @@ export function registerMemoryRead(pi: ExtensionAPI, settings: MemoryMdSettings)
         const memory = readMemoryFile(fullPath);
         if (!memory) throw new Error("File could not be parsed");
 
-        const { id, kind, description = "No description", tags = [] } = memory.frontmatter;
         return {
-          content: [
-            {
-              type: "text",
-              text: `# ${description}\n\nID: ${id ? `@${id}` : "none"}\nKind: ${kind ?? "legacy"}\nTags: ${tags.join(", ") || "none"}\n\n${memory.content}`,
-            },
-          ],
-          details: { path: path.relative(memoryDir, fullPath), frontmatter: memory.frontmatter },
+          content: [{ type: "text", text: formatMemoryRead(memory, view) }],
+          details: { path: path.relative(memoryDir, fullPath), frontmatter: memory.frontmatter, view },
         };
       } catch (error) {
         return {
@@ -333,14 +335,24 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
     name: "memory_write",
     label: "Memory Write",
     description:
-      "Create or replace a compact project memory record. Logical state/ and events/ paths are stored under records/<stable-id>.md. " +
-      "An optional facts block uses dotted.key = JSON-value or relation.key -> @stable.id between memory:facts:v1 markers.",
+      "Create or replace a structured project memory record. Logical state/ and events/ paths are stored under records/<stable-id>.md. " +
+      "Prefer summary, concepts, claims, facts, relations, and optional notes over long prose.",
     parameters: Type.Object({
       path: Type.String({
         description: "Relative .md path under logical state/ or events/, or records/<stable-id>.md",
       }),
-      content: Type.String({ description: "Markdown content, optionally including one managed memory facts block" }),
+      content: Type.Optional(
+        Type.String({ description: "Full Markdown content; optional when structured fields are provided" }),
+      ),
       description: Type.String({ description: "Concise purpose shown in the recent-memory index" }),
+      summary: Type.Optional(Type.String({ description: "One-sentence semantic summary for compact reads" })),
+      concepts: Type.Optional(Type.Array(Type.String({ description: "Core concepts captured by this memory" }))),
+      claims: Type.Optional(Type.Array(Type.String({ description: "Important conclusions or decisions" }))),
+      facts: Type.Optional(
+        Type.Record(Type.String(), Type.Any({ description: "Machine-readable scalar/array fact values" })),
+      ),
+      relations: Type.Optional(Type.Record(Type.String(), Type.String({ description: "Relation target stable @id" }))),
+      notes: Type.Optional(Type.String({ description: "Optional prose/evidence rendered after structured knowledge" })),
       tags: Type.Optional(Type.Array(Type.String())),
       kind: Type.Optional(
         Type.Union([Type.Literal("state"), Type.Literal("event")], {
@@ -354,19 +366,40 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
         path: relPath,
         content,
         description,
+        summary,
+        concepts,
+        claims,
+        facts,
+        relations,
+        notes,
         tags,
         kind: requestedKind,
       } = params as {
         path: string;
-        content: string;
+        content?: string;
         description: string;
         tags?: string[];
         kind?: "state" | "event";
-      };
+      } & StructuredMemoryFields;
       const memoryDir = getMemoryDir(settings, ctx.cwd);
 
       try {
-        const contentValidation = validateMemoryContent(content);
+        const hasStructuredFields = Boolean(
+          summary ||
+            concepts?.length ||
+            claims?.length ||
+            Object.keys(facts ?? {}).length ||
+            Object.keys(relations ?? {}).length ||
+            notes,
+        );
+        if (!content && !hasStructuredFields) throw new Error("Either content or structured fields must be provided");
+        if (content && (Object.keys(facts ?? {}).length || Object.keys(relations ?? {}).length || notes)) {
+          throw new Error("facts, relations, and notes are only generated when content is omitted");
+        }
+        const memoryContent =
+          content ?? buildStructuredMemoryContent({ description, summary, concepts, claims, facts, relations, notes });
+
+        const contentValidation = validateMemoryContent(memoryContent);
         if (!contentValidation.valid) throw new Error(contentValidation.error);
 
         const legacyPath = resolveMemoryPath(memoryDir, relPath);
@@ -384,6 +417,9 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
         const frontmatter: MemoryFrontmatter = {
           ...existing?.frontmatter,
           description,
+          summary,
+          concepts,
+          claims,
           created: existing?.frontmatter.created ?? today,
           updated: today,
           ...(tags && { tags }),
@@ -391,7 +427,7 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
         delete frontmatter.id;
         delete frontmatter.kind;
 
-        writeMemoryFile(target.filePath, content, frontmatter);
+        writeMemoryFile(target.filePath, memoryContent, frontmatter);
         upsertMemoryCatalog(memoryDir, target.filePath);
         const relTarget = path.relative(memoryDir, target.filePath);
         return {
@@ -485,6 +521,9 @@ export function registerMemorySearch(pi: ExtensionAPI, settings: MemoryMdSetting
           Type.Literal("content"),
           Type.Literal("tags"),
           Type.Literal("description"),
+          Type.Literal("summary"),
+          Type.Literal("concepts"),
+          Type.Literal("claims"),
           Type.Literal("id"),
           Type.Literal("all"),
         ],
