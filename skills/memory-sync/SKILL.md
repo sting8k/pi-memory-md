@@ -39,7 +39,7 @@ Auto-commits changes before pushing.
 memory_check()
 ```
 
-This verifies that the folder structure is correct (e.g., files are in `core/project/` not in a root `project/` folder).
+This verifies that the current Git project resolves to a valid `projects/<project-slug>/{state,events}` layout.
 
 ### Status
 

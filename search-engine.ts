@@ -8,14 +8,16 @@ import type { MemoryFile } from "./types.js";
 
 // ── Types ──
 
+export type MatchedField = "content" | "tags" | "description" | "id" | "kind";
+
 export interface SearchHit {
   path: string;
   snippet: string;
   matchCount: number;
-  matchedIn: Array<"content" | "tags" | "description">;
+  matchedIn: MatchedField[];
 }
 
-export type SearchField = "content" | "tags" | "description" | "all";
+export type SearchField = "content" | "tags" | "description" | "id" | "all";
 
 const MAX_SEARCH_RESULTS = 10;
 const MAX_SNIPPET_CHARS = 500;
@@ -189,16 +191,26 @@ function buildSearchText(memory: MemoryFile, field: SearchField): string {
       return memory.frontmatter.tags?.join(" ") ?? "";
     case "description":
       return memory.frontmatter.description;
+    case "id":
+      return memory.frontmatter.id ?? "";
     case "all":
-      return [memory.frontmatter.description, memory.frontmatter.tags?.join(" ") ?? "", memory.content].join("\n");
+      return [
+        memory.frontmatter.id ?? "",
+        memory.frontmatter.kind ?? "",
+        memory.frontmatter.description,
+        memory.frontmatter.tags?.join(" ") ?? "",
+        memory.content,
+      ].join("\n");
   }
 }
 
-function detectMatchedFields(memory: MemoryFile, regex: RegExp): Array<"content" | "tags" | "description"> {
-  const fields: Array<"content" | "tags" | "description"> = [];
+function detectMatchedFields(memory: MemoryFile, regex: RegExp): MatchedField[] {
+  const fields: MatchedField[] = [];
   if (regex.test(memory.content)) fields.push("content");
   if (memory.frontmatter.tags?.some((t) => regex.test(t))) fields.push("tags");
   if (regex.test(memory.frontmatter.description)) fields.push("description");
+  if (memory.frontmatter.id && regex.test(memory.frontmatter.id)) fields.push("id");
+  if (memory.frontmatter.kind && regex.test(memory.frontmatter.kind)) fields.push("kind");
   return fields;
 }
 
@@ -209,10 +221,17 @@ function buildSnippet(memory: MemoryFile, searchIn: SearchField, regex: RegExp):
 
   if (searchIn === "tags") return tagSnippet();
   if (searchIn === "description") return descriptionSnippet();
+  if (searchIn === "id") return truncateSnippet(`ID: ${memory.frontmatter.id ?? "none"}`);
   if (searchIn === "all") {
     if (regex.test(memory.content)) return lineSnippet(memory.content, regex);
     if (memory.frontmatter.tags?.some((tag) => regex.test(tag))) return tagSnippet();
     if (regex.test(memory.frontmatter.description)) return descriptionSnippet();
+    if (memory.frontmatter.id && regex.test(memory.frontmatter.id)) {
+      return truncateSnippet(`ID: ${memory.frontmatter.id}`);
+    }
+    if (memory.frontmatter.kind && regex.test(memory.frontmatter.kind)) {
+      return truncateSnippet(`Kind: ${memory.frontmatter.kind}`);
+    }
   }
   return lineSnippet(memory.content, regex);
 }
@@ -223,14 +242,15 @@ export interface SearchInput {
   files: Map<string, MemoryFile>;
   query: string;
   searchIn: SearchField;
+  kind?: "state" | "event";
 }
 
 export function searchMemoryFiles(input: SearchInput): SearchHit[] {
-  const { files, query, searchIn } = input;
+  const { files, query, searchIn, kind } = input;
   const rawQuery = query.trim();
   if (!rawQuery) return [];
 
-  const entries = Array.from(files.entries());
+  const entries = Array.from(files.entries()).filter(([, memory]) => !kind || memory.frontmatter.kind === kind);
 
   // Regex mode: query contains metacharacters
   if (looksLikeRegex(rawQuery)) {

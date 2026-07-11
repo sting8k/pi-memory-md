@@ -37,9 +37,8 @@ export default function memoryMdExtension(pi: ExtensionAPI) {
     if (!settings.enabled) return false;
 
     const memoryDir = getMemoryDir(settings, ctx.cwd);
-    const coreDir = path.join(memoryDir, "core");
 
-    if (!fs.existsSync(coreDir)) {
+    if (!fs.existsSync(memoryDir)) {
       if (options.showNotification) {
         ctx.ui.notify("Memory-md not initialized. Use /memory-init to set up project memory.", "info");
       }
@@ -253,11 +252,10 @@ export default function memoryMdExtension(pi: ExtensionAPI) {
   pi.registerCommand("memory-status", {
     description: "Show memory repository status",
     handler: async (_args, ctx) => {
-      const projectName = path.basename(ctx.cwd);
       const memoryDir = getMemoryDir(settings, ctx.cwd);
-      const coreUserDir = path.join(memoryDir, "core", "user");
+      const projectName = path.basename(memoryDir);
 
-      if (!fs.existsSync(coreUserDir)) {
+      if (!fs.existsSync(memoryDir)) {
         ctx.ui.notify(`Memory: ${projectName} | Not initialized | Use /memory-init to set up`, "info");
         return;
       }
@@ -276,7 +274,7 @@ export default function memoryMdExtension(pi: ExtensionAPI) {
     description: "Initialize memory repository",
     handler: async (_args, ctx) => {
       const memoryDir = getMemoryDir(settings, ctx.cwd);
-      const alreadyInitialized = fs.existsSync(path.join(memoryDir, "core", "user"));
+      const alreadyInitialized = fs.existsSync(memoryDir);
 
       const result = await syncRepository(pi, settings, repoInitialized);
 
@@ -291,10 +289,7 @@ export default function memoryMdExtension(pi: ExtensionAPI) {
       if (alreadyInitialized) {
         ctx.ui.notify(`Memory already exists: ${result.message}`, "info");
       } else {
-        ctx.ui.notify(
-          `Memory initialized: ${result.message}\n\nCreated:\n  - core/user\n  - core/project\n  - reference`,
-          "info",
-        );
+        ctx.ui.notify(`Memory initialized: ${result.message}\n\nCreated:\n  - state\n  - events`, "info");
       }
     },
   });

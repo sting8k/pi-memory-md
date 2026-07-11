@@ -23,8 +23,7 @@
   ],
   "dependencies": {
     "@biomejs/biome": "^2.4.10",
-    "@sinclair/typebox": "^0.34.41",
-    "gray-matter": "^4.0.3"
+    "@sinclair/typebox": "^0.34.41"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.78.0",
@@ -46,7 +45,9 @@
   "files": [
     "index.ts",
     "memoryMdCore.ts",
+    "frontmatter.ts",
     "tools.ts",
+    "search-engine.ts",
     "types.ts",
     "tape",
     "skills",
@@ -55,7 +56,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "check": "biome check --write --error-on-warnings . && tsgo --noEmit"
+    "check": "biome check --write --error-on-warnings . && tsgo --noEmit",
+    "test": "rm -rf .test-dist && tsc --noEmit false --outDir .test-dist && node --test tests/*.test.mjs; status=$?; rm -rf .test-dist; exit $status"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "^0.78.0",

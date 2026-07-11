@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import matter from "gray-matter";
+import { readFrontmatterFile } from "../frontmatter.js";
+import { listMemoryFiles } from "../memoryMdCore.js";
 import type { MemoryTapeService } from "./tape-service.js";
 import type { TapeEntry } from "./tape-types.js";
 
@@ -185,8 +186,14 @@ export class MemoryFileSelector {
 
     const lines = ["# Project Memory", "", "Available memory files (use memory_read to view full content):", ""];
     for (const relPath of filePaths) {
-      const { description, tags } = this.extractFrontmatter(relPath);
-      lines.push(`- ${relPath}`, `  Description: ${description}`, `  Tags: ${tags}`, "");
+      const { id, kind, description, tags } = this.extractFrontmatter(relPath);
+      lines.push(
+        `- ${relPath}${id ? ` (@${id})` : ""}`,
+        `  Kind: ${kind}`,
+        `  Description: ${description}`,
+        `  Tags: ${tags}`,
+        "",
+      );
     }
 
     return lines.join("\n");
@@ -218,41 +225,32 @@ export class MemoryFileSelector {
   }
 
   private scanMemoryDirectory(limit: number): string[] {
-    const coreDir = path.join(this.memoryDir, "core");
-    if (!fs.existsSync(coreDir)) return [];
-
-    const paths: string[] = [];
-    const scanDir = (dir: string, base: string): void => {
-      if (paths.length >= limit) return;
-
-      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-        if (paths.length >= limit || entry.name.startsWith(".")) continue;
-
-        const fullPath = path.join(dir, entry.name);
-        const relPath = path.join(base, entry.name);
-
-        if (entry.isDirectory()) {
-          scanDir(fullPath, relPath);
-        } else if (entry.isFile() && entry.name.endsWith(".md")) {
-          paths.push(relPath);
-        }
-      }
-    };
-
-    scanDir(coreDir, "core");
-    return paths;
+    return listMemoryFiles(this.memoryDir)
+      .map((filePath) => {
+        const { data } = readFrontmatterFile(filePath);
+        const timestamp = Date.parse(String(data.updated ?? data.created ?? ""));
+        return {
+          relPath: path.relative(this.memoryDir, filePath),
+          timestamp: Number.isNaN(timestamp) ? fs.statSync(filePath).mtimeMs : timestamp,
+        };
+      })
+      .sort((a, b) => b.timestamp - a.timestamp || a.relPath.localeCompare(b.relPath))
+      .slice(0, limit)
+      .map(({ relPath }) => relPath);
   }
 
-  private extractFrontmatter(relPath: string): { description: string; tags: string } {
+  private extractFrontmatter(relPath: string): { id?: string; kind: string; description: string; tags: string } {
     const fullPath = path.join(this.memoryDir, relPath);
     try {
-      const { data } = matter.read(fullPath);
+      const { data } = readFrontmatterFile(fullPath);
       return {
+        id: typeof data.id === "string" ? data.id : undefined,
+        kind: typeof data.kind === "string" ? data.kind : "legacy",
         description: (data.description as string)?.trim() || "No description",
         tags: Array.isArray(data.tags) && data.tags.length > 0 ? data.tags.join(", ") : "none",
       };
     } catch {
-      return { description: "No description", tags: "none" };
+      return { kind: "legacy", description: "No description", tags: "none" };
     }
   }
 }

@@ -1,10 +1,14 @@
-import type { GrayMatterFile } from "gray-matter";
+import type { FrontmatterData } from "./frontmatter.js";
 
 /**
  * Type definitions for memory files, settings, and git operations.
  */
 
+export type MemoryKind = "state" | "event";
+
 export interface MemoryFrontmatter {
+  id?: string;
+  kind?: MemoryKind;
   description: string;
   limit?: number;
   tags?: string[];
@@ -57,4 +61,4 @@ export interface SyncResult {
   updated?: boolean;
 }
 
-export type ParsedFrontmatter = GrayMatterFile<string>["data"];
+export type ParsedFrontmatter = FrontmatterData;
