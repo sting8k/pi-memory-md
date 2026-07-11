@@ -17,6 +17,7 @@ import {
   MEMORY_FACTS_START,
   memoryFileFromCatalogEntry,
   migrateMemoryProject,
+  normalizeConceptLabel,
   normalizeConceptSearchQuery,
   normalizeMemoryConcepts,
   parseMemoryFacts,
@@ -199,7 +200,7 @@ test("concept dictionary normalizes aliases and registers safe new concepts", ()
       `${JSON.stringify(
         {
           version: 1,
-          concepts: ["identity-addressed-record", "metadata-cache", "semantic-projection"],
+          concepts: ["cafe-memory", "identity-addressed-record", "metadata-cache", "semantic-projection"],
           aliases: { "id-based-record": "identity-addressed-record", "knowledge-view": "semantic-projection" },
         },
         null,
@@ -230,6 +231,7 @@ test("concept dictionary normalizes aliases and registers safe new concepts", ()
 
     const dictionary = getConceptDictionary(memoryDir);
     assert.deepEqual(dictionary.concepts, [
+      "cafe-memory",
       "compact-context",
       "identity-addressed-record",
       "metadata-cache",
@@ -237,6 +239,11 @@ test("concept dictionary normalizes aliases and registers safe new concepts", ()
       "semantic-projection",
     ]);
     assert.equal(normalizeConceptSearchQuery(memoryDir, "id based record"), "identity-addressed-record");
+    assert.equal(normalizeConceptLabel("Café Memory"), "cafe-memory");
+    assert.equal(
+      normalizeConceptSearchQuery(memoryDir, "id based record knowledge view"),
+      "identity-addressed-record semantic-projection",
+    );
     assert.equal(normalizeConceptSearchQuery(memoryDir, "free form query"), "free form query");
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
@@ -253,7 +260,7 @@ test("memory tools normalize concepts transparently", async () => {
       `${JSON.stringify(
         {
           version: 1,
-          concepts: ["identity-addressed-record", "semantic-projection"],
+          concepts: ["identity-addressed-record", "metadata-cache", "semantic-projection"],
           aliases: { "id-based-record": "identity-addressed-record", "knowledge-view": "semantic-projection" },
         },
         null,
@@ -273,7 +280,7 @@ test("memory tools normalize concepts transparently", async () => {
         kind: "event",
         description: "Concept tool test",
         summary: "Concept aliases are normalized before records are written",
-        concepts: ["ID based records", "Knowledge View", "ID based record"],
+        concepts: ["ID based records", "Knowledge View", "ID based record", "metadata cash"],
         claims: ["Tool calls should store canonical concepts"],
       },
       signal,
@@ -281,9 +288,17 @@ test("memory tools normalize concepts transparently", async () => {
       { cwd: workspace },
     );
 
-    assert.deepEqual(writeResult.details.frontmatter.concepts, ["identity-addressed-record", "semantic-projection"]);
+    assert.deepEqual(writeResult.details.frontmatter.concepts, [
+      "identity-addressed-record",
+      "metadata-cash",
+      "semantic-projection",
+    ]);
     assert.equal(writeResult.details.concepts.resolvedAliases["id-based-records"], "identity-addressed-record");
     assert.equal(writeResult.details.concepts.resolvedAliases["knowledge-view"], "semantic-projection");
+    assert.match(writeResult.content[0].text, /Possible duplicate concepts:/);
+    assert.match(writeResult.content[0].text, /metadata-cash is similar to metadata-cache/);
+    assert.match(writeResult.details.frontmatter.created, /^\d{4}-\d{2}-\d{2}T/);
+    assert.match(writeResult.details.frontmatter.updated, /^\d{4}-\d{2}-\d{2}T/);
 
     const searchResult = await tools
       .get("memory_search")
@@ -291,6 +306,29 @@ test("memory tools normalize concepts transparently", async () => {
     assert.equal(searchResult.details.query, "identity-addressed-record");
     assert.equal(searchResult.details.count, 1);
     assert.equal(searchResult.details.results[0].path, path.join("records", "event.concept-tool.md"));
+
+    await tools.get("memory_write").execute(
+      "write-2",
+      {
+        path: "events/concept-distractor.md",
+        kind: "event",
+        description: "Concept distractor test",
+        summary: "This record has only one of the searched concepts",
+        concepts: ["ID based record"],
+        claims: ["Exact concept search should not return this record for two-concept queries"],
+      },
+      signal,
+      () => {},
+      { cwd: workspace },
+    );
+    const multiConceptSearch = await tools
+      .get("memory_search")
+      .execute("search-2", { query: "id based record Knowledge View", searchIn: "concepts" }, signal, () => {}, {
+        cwd: workspace,
+      });
+    assert.equal(multiConceptSearch.details.query, "identity-addressed-record semantic-projection");
+    assert.equal(multiConceptSearch.details.count, 1);
+    assert.equal(multiConceptSearch.details.results[0].path, path.join("records", "event.concept-tool.md"));
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

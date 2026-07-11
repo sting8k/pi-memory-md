@@ -288,6 +288,26 @@ export function searchMemoryFiles(input: SearchInput): SearchHit[] {
     return hits.slice(0, MAX_SEARCH_RESULTS);
   }
 
+  const exactConceptTerms = rawQuery.split(/\s+/).filter((term) => /^[a-z0-9]+(?:-[a-z0-9]+)+$/.test(term));
+  if (
+    searchIn === "concepts" &&
+    exactConceptTerms.length > 0 &&
+    exactConceptTerms.length === rawQuery.split(/\s+/).length
+  ) {
+    const hits: SearchHit[] = [];
+    for (const [relPath, memory] of entries) {
+      const concepts = memory.frontmatter.concepts ?? [];
+      if (!exactConceptTerms.every((term) => concepts.includes(term))) continue;
+      hits.push({
+        path: relPath,
+        snippet: buildSnippet(memory, searchIn, snippetRegex(exactConceptTerms)),
+        matchCount: exactConceptTerms.length,
+        matchedIn: ["concepts"],
+      });
+    }
+    return hits.slice(0, MAX_SEARCH_RESULTS);
+  }
+
   // Natural language mode: OR match, sorted by matchCount desc
   const terms = filterStopwords(rawQuery.split(/\s+/));
   const termRegexes = literalTermRegexes(terms);

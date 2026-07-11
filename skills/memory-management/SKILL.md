@@ -63,6 +63,8 @@ The extension generates the stable ID from the logical path. For example, `event
 
 Concepts are normalized transparently through `.concepts.json`: use natural labels, and the tool lowercases/kebab-cases them, resolves known aliases, deduplicates them, and auto-registers new concepts. Ambiguous near-duplicates are returned as advisory details; they do not block writes.
 
+`memory_write` also sets ISO `created`/`updated` timestamps automatically, so same-day memories still sort by write time.
+
 ## Reading
 
 Read by path:

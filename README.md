@@ -65,8 +65,8 @@ Every new memory record is addressed by its stable project-local filename. The I
 description: "Investigation of local extension loading"
 tags:
   - "runtime"
-created: "2026-07-11"
-updated: "2026-07-11"
+created: "2026-07-11T14:37:00.000Z"
+updated: "2026-07-11T14:37:00.000Z"
 ---
 # Runtime investigation
 
@@ -127,6 +127,8 @@ Project memory keeps concept vocabulary simple and transparent:
 ```
 
 `memory_write` normalizes concept spelling, resolves aliases, deduplicates concepts, and registers new concepts automatically. `memory_search({ searchIn: "concepts" })` is alias-aware. The tool does not silently merge ambiguous semantic near-duplicates; it only returns advisory duplicate hints in tool details.
+
+Memory writes store ISO `created`/`updated` timestamps so same-day records can still sort by write time.
 
 ## Legacy migration
 

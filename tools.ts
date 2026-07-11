@@ -28,7 +28,13 @@ import {
   writeMemoryFile,
 } from "./memoryMdCore.js";
 import { type SearchField, searchMemoryFiles } from "./search-engine.js";
-import type { MemoryFrontmatter, MemoryMdSettings, MemoryReadView, StructuredMemoryFields } from "./types.js";
+import type {
+  ConceptDuplicateHint,
+  MemoryFrontmatter,
+  MemoryMdSettings,
+  MemoryReadView,
+  StructuredMemoryFields,
+} from "./types.js";
 
 // Re-export types for convenience
 export type { ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
@@ -62,6 +68,13 @@ function getResultText(result: { content: Array<{ type: string; text?: string }>
   return result.content[0]?.text ?? "";
 }
 
+function formatConceptDuplicateHints(hints?: ConceptDuplicateHint[]): string {
+  if (!hints?.length) return "";
+  return [
+    "Possible duplicate concepts:",
+    ...hints.map((hint) => `- ${hint.concept} is similar to ${hint.candidate} (${hint.score})`),
+  ].join("\n");
+}
 function buildExpandHint(totalLines: number, theme: Theme): string {
   const remaining = totalLines - 1;
   if (remaining <= 0) return "";
@@ -83,7 +96,7 @@ function renderMemoryResult(
   result: { content: Array<{ type: string; text?: string }>; details?: unknown },
   options: { expanded: boolean; isPartial: boolean },
   theme: Theme,
-  defaults?: { description?: string; tags?: string[] },
+  defaults?: { description?: string; tags?: string[]; notice?: string },
 ): Text {
   if (options.isPartial) return renderText(theme.fg("warning", "Reading..."));
   const details = result.details as
@@ -94,15 +107,22 @@ function renderMemoryResult(
   const description = defaults?.description || details?.frontmatter?.description || "Memory file";
   const tags = defaults?.tags || details?.frontmatter?.tags || [];
   const text = getResultText(result);
+  const notice = defaults?.notice;
 
   if (!options.expanded) {
-    const summary = `${theme.fg("success", description)}\n${theme.fg("muted", `Tags: ${tags.join(", ") || "none"}`)}`;
-    return renderText(summary + buildExpandHint(text.split("\n").length + 2, theme));
+    const summary = [
+      theme.fg("success", description),
+      theme.fg("muted", `Tags: ${tags.join(", ") || "none"}`),
+      notice ? theme.fg("warning", notice) : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    return renderText(summary + buildExpandHint(text.split("\n").length + summary.split("\n").length, theme));
   }
 
   return renderText(
     theme.fg("success", description) +
-      `\n${theme.fg("muted", `Tags: ${tags.join(", ") || "none"}`)}\n${theme.fg("toolOutput", text)}`,
+      `\n${theme.fg("muted", `Tags: ${tags.join(", ") || "none"}`)}${notice ? `\n${theme.fg("warning", notice)}` : ""}\n${theme.fg("toolOutput", text)}`,
   );
 }
 
@@ -443,8 +463,14 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
         writeMemoryFile(target.filePath, memoryContent, frontmatter);
         upsertMemoryCatalog(memoryDir, target.filePath);
         const relTarget = path.relative(memoryDir, target.filePath);
+        const duplicateHints = formatConceptDuplicateHints(conceptNormalization.audit.possibleDuplicates);
         return {
-          content: [{ type: "text", text: `Memory file written: ${relTarget} (@${target.id})` }],
+          content: [
+            {
+              type: "text",
+              text: [`Memory file written: ${relTarget} (@${target.id})`, duplicateHints].filter(Boolean).join("\n\n"),
+            },
+          ],
           details: {
             path: target.filePath,
             frontmatter: { ...frontmatter, id: target.id, kind: target.kind },
@@ -461,10 +487,14 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
 
     renderCall: (args, theme) => new Text(buildToolCallText("memory_write", args, theme), 0, 0),
     renderResult: (result, options, theme) => {
-      const details = result.details as { frontmatter?: { description?: string; tags?: string[] } };
+      const details = result.details as {
+        frontmatter?: { description?: string; tags?: string[] };
+        concepts?: { possibleDuplicates?: ConceptDuplicateHint[] };
+      };
       return renderMemoryResult(result, options, theme, {
         description: details?.frontmatter?.description,
         tags: details?.frontmatter?.tags,
+        notice: formatConceptDuplicateHints(details?.concepts?.possibleDuplicates),
       });
     },
   });

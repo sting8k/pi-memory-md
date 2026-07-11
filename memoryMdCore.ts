@@ -40,7 +40,7 @@ export function getLocalPath(): string {
 }
 
 export function getCurrentDate(): string {
-  return new Date().toISOString().split("T")[0];
+  return new Date().toISOString();
 }
 
 function expandPath(p: string): string {
@@ -677,7 +677,11 @@ function emptyConceptAudit(): ConceptNormalizationAudit {
 export function normalizeConceptLabel(label: string): string {
   return label
     .trim()
+    .normalize("NFKD")
+    .replace(/[ĐÐ]/g, "D")
+    .replace(/[đð]/g, "d")
     .toLowerCase()
+    .replace(/[\u0300-\u036f]/g, "")
     .replace(/['’]/g, "")
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
@@ -771,12 +775,12 @@ function resolveConcept(dictionary: ConceptDictionary, concept: string): { canon
   const normalized = normalizeConceptLabel(concept);
   if (!normalized) return null;
   if (dictionary.aliases[normalized]) return { canonical: dictionary.aliases[normalized], alias: normalized };
-  if (dictionary.concepts.includes(normalized)) return { canonical: normalized };
   if (normalized.endsWith("s")) {
     const singular = normalized.slice(0, -1);
     if (dictionary.aliases[singular]) return { canonical: dictionary.aliases[singular], alias: normalized };
     if (dictionary.concepts.includes(singular)) return { canonical: singular, alias: normalized };
   }
+  if (dictionary.concepts.includes(normalized)) return { canonical: normalized };
   return { canonical: normalized };
 }
 
@@ -784,10 +788,41 @@ function resolveKnownConcept(dictionary: ConceptDictionary, concept: string): st
   const normalized = normalizeConceptLabel(concept);
   if (!normalized) return null;
   if (dictionary.aliases[normalized]) return dictionary.aliases[normalized];
-  if (dictionary.concepts.includes(normalized)) return normalized;
-  if (!normalized.endsWith("s")) return null;
-  const singular = normalized.slice(0, -1);
-  return dictionary.aliases[singular] ?? (dictionary.concepts.includes(singular) ? singular : null);
+  if (normalized.endsWith("s")) {
+    const singular = normalized.slice(0, -1);
+    const resolved = dictionary.aliases[singular] ?? (dictionary.concepts.includes(singular) ? singular : null);
+    if (resolved) return resolved;
+  }
+  return dictionary.concepts.includes(normalized) ? normalized : null;
+}
+
+function tokenizeConceptQuery(query: string): string[] {
+  return query
+    .trim()
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
+
+function normalizeKnownConceptSequence(dictionary: ConceptDictionary, query: string): string[] | null {
+  const tokens = tokenizeConceptQuery(query);
+  if (tokens.length === 0) return null;
+  const concepts: string[] = [];
+  for (let index = 0; index < tokens.length; ) {
+    let matched: { concept: string; length: number } | null = null;
+    for (let length = Math.min(6, tokens.length - index); length > 0; length--) {
+      const candidate = tokens.slice(index, index + length).join(" ");
+      const concept = resolveKnownConcept(dictionary, candidate);
+      if (concept) {
+        matched = { concept, length };
+        break;
+      }
+    }
+    if (!matched) return null;
+    concepts.push(matched.concept);
+    index += matched.length;
+  }
+  return concepts;
 }
 
 export function normalizeMemoryConcepts(
@@ -824,11 +859,18 @@ export function normalizeMemoryConcepts(
 
 export function normalizeConceptSearchQuery(memoryDir: string, query: string): string {
   const dictionary = getConceptDictionary(memoryDir);
-  const parts = query.includes(",") ? query.split(",") : [query];
-  const normalized = parts
-    .map((part) => resolveKnownConcept(dictionary, part.trim()))
-    .filter((part): part is string => Boolean(part));
-  return normalized.length === parts.length ? normalized.join(" ") : query;
+  if (query.includes(",")) {
+    const parts = query.split(",").map((part) => part.trim());
+    const normalized = parts
+      .map((part) => resolveKnownConcept(dictionary, part))
+      .filter((part): part is string => Boolean(part));
+    return normalized.length === parts.length ? uniqueSorted(normalized).join(" ") : query;
+  }
+
+  const whole = resolveKnownConcept(dictionary, query);
+  if (whole) return whole;
+  const sequence = normalizeKnownConceptSequence(dictionary, query);
+  return sequence ? uniqueSorted(sequence).join(" ") : query;
 }
 function isMemoryFactValue(value: unknown): value is MemoryFactValue {
   if (value === null) return true;
