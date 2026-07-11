@@ -5,3 +5,10 @@ dist/
 *.tgz
 .pi/
 test-search-compare.ts
+
+# Harness durable layer
+harness.db
+harness.db-wal
+harness.db-shm
+scripts/bin/harness-cli
+scripts/bin/harness-cli.exe
