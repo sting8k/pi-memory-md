@@ -232,7 +232,7 @@ export default function memoryMdExtension(pi: ExtensionAPI) {
       return {
         message: {
           customType: "pi-memory-md",
-          content: `# Project Memory\n\n${cachedMemoryContext}`,
+          content: cachedMemoryContext,
           display: false,
         },
       };
@@ -240,7 +240,7 @@ export default function memoryMdExtension(pi: ExtensionAPI) {
 
     if (mode === "system-prompt") {
       return {
-        systemPrompt: `${event.systemPrompt}\n\n# Project Memory\n\n${cachedMemoryContext}`,
+        systemPrompt: `${event.systemPrompt}\n\n${cachedMemoryContext}`,
       };
     }
 
@@ -313,7 +313,7 @@ export default function memoryMdExtension(pi: ExtensionAPI) {
       if (mode === "message-append") {
         pi.sendMessage({
           customType: "pi-memory-md-refresh",
-          content: `# Project Memory (Refreshed)\n\n${memoryContext}`,
+          content: memoryContext.replace(/^# Project Memory/, "# Project Memory (Refreshed)"),
           display: false,
         });
         ctx.ui.notify(`Memory refreshed: ${fileCount} files injected (${mode})`, "info");
