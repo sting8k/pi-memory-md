@@ -49,19 +49,6 @@ export interface MemoryMdSettings {
     maxTokens?: number;
     includeProjects?: string[];
   };
-  tape?: {
-    enabled?: boolean;
-    context?: {
-      strategy?: "smart" | "recent-only";
-      fileLimit?: number;
-      alwaysInclude?: string[];
-    };
-    anchor?: {
-      mode?: "hand" | "threshold" | "manual";
-      threshold?: number;
-    };
-    tapePath?: string;
-  };
 }
 
 export interface GitResult {

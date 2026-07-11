@@ -49,7 +49,6 @@
     "tools.ts",
     "search-engine.ts",
     "types.ts",
-    "tape",
     "skills",
     "README.md",
     "CHANGELOG.md",

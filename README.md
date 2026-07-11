@@ -54,7 +54,6 @@ Each Git workspace gets an isolated project directory derived from its Git root 
 | `memory_migrate` | Rename a project or migrate a legacy project layout |
 | `memory_check` | Check project memory structure |
 
-There is no append operation and no separate tape tool API.
 
 ## Frontmatter
 
