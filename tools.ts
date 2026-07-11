@@ -6,19 +6,20 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import {
   createDefaultFiles,
-  createMemoryId,
   ensureDirectoryStructure,
-  findMemoryFileById,
   getCurrentDate,
+  getMemoryCatalog,
   getMemoryDir,
   gitExec,
-  inferMemoryKind,
   listMemoryFiles,
+  memoryFileFromCatalogEntry,
   migrateMemoryProject,
   readMemoryFile,
   resolveMemoryFile,
   resolveMemoryPath,
+  resolveMemoryWriteTarget,
   syncRepository,
+  upsertMemoryCatalog,
   validateMemoryContent,
   writeMemoryFile,
 } from "./memoryMdCore.js";
@@ -191,11 +192,10 @@ export function registerMemorySync(
       const { action } = params as { action: "pull" | "push" | "status" };
       const localPath = settings.localPath!;
       const memoryDir = getMemoryDir(settings, ctx.cwd);
-      const stateDir = path.join(memoryDir, "state");
-      const eventsDir = path.join(memoryDir, "events");
+      const recordsDir = path.join(memoryDir, "records");
 
       if (action === "status") {
-        const initialized = isRepoInitialized.value && fs.existsSync(stateDir) && fs.existsSync(eventsDir);
+        const initialized = isRepoInitialized.value && fs.existsSync(recordsDir);
         if (!initialized) {
           return {
             content: [{ type: "text", text: "Memory repository not initialized. Use memory_init to set up." }],
@@ -291,7 +291,8 @@ export function registerMemoryRead(pi: ExtensionAPI, settings: MemoryMdSettings)
     description: "Read a project memory file by relative path or stable @id",
     parameters: Type.Object({
       path: Type.String({
-        description: "Relative path (e.g. 'state/runtime.md') or stable ID (e.g. '@state.runtime')",
+        description:
+          "Relative path (e.g. 'records/state.runtime.md' or logical 'state/runtime.md') or stable ID (e.g. '@state.runtime')",
       }),
     }),
 
@@ -332,16 +333,18 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
     name: "memory_write",
     label: "Memory Write",
     description:
-      "Create or replace a compact project memory file. Use state/ for current knowledge and events/ for time-bound reports. " +
+      "Create or replace a compact project memory record. Logical state/ and events/ paths are stored under records/<stable-id>.md. " +
       "An optional facts block uses dotted.key = JSON-value or relation.key -> @stable.id between memory:facts:v1 markers.",
     parameters: Type.Object({
-      path: Type.String({ description: "Relative .md path under state/ or events/" }),
+      path: Type.String({
+        description: "Relative .md path under logical state/ or events/, or records/<stable-id>.md",
+      }),
       content: Type.String({ description: "Markdown content, optionally including one managed memory facts block" }),
       description: Type.String({ description: "Concise purpose shown in the recent-memory index" }),
       tags: Type.Optional(Type.Array(Type.String())),
       kind: Type.Optional(
         Type.Union([Type.Literal("state"), Type.Literal("event")], {
-          description: "Optional lifecycle; inferred from state/ or events/ and must match the path",
+          description: "Optional lifecycle; inferred from logical path or record ID and must match it",
         }),
       ),
     }),
@@ -363,45 +366,37 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
       const memoryDir = getMemoryDir(settings, ctx.cwd);
 
       try {
-        const fullPath = resolveMemoryPath(memoryDir, relPath);
-        if (!relPath.endsWith(".md")) throw new Error("Memory path must end with .md");
-
-        const inferredKind = inferMemoryKind(memoryDir, fullPath);
-        if (!inferredKind) throw new Error("Memory path must be under state/ or events/");
-        if (requestedKind && requestedKind !== inferredKind) {
-          throw new Error(`kind '${requestedKind}' does not match path lifecycle '${inferredKind}'`);
-        }
-
         const contentValidation = validateMemoryContent(content);
         if (!contentValidation.valid) throw new Error(contentValidation.error);
 
-        const existing = readMemoryFile(fullPath);
-        const existingKind = existing?.frontmatter.kind;
-        if (existingKind && existingKind !== inferredKind) {
-          throw new Error(`Existing kind '${existingKind}' does not match path lifecycle '${inferredKind}'`);
-        }
+        const legacyPath = resolveMemoryPath(memoryDir, relPath);
+        const legacyExisting = fs.existsSync(legacyPath) ? readMemoryFile(legacyPath) : null;
+        const target = resolveMemoryWriteTarget(
+          memoryDir,
+          relPath,
+          requestedKind,
+          legacyExisting?.frontmatter.id,
+          legacyExisting?.frontmatter.kind,
+        );
+        const existing = fs.existsSync(target.filePath) ? readMemoryFile(target.filePath) : legacyExisting;
 
         const today = getCurrentDate();
-        const id = existing?.frontmatter.id ?? createMemoryId(memoryDir, fullPath, inferredKind);
-        const duplicate = findMemoryFileById(memoryDir, id);
-        if (duplicate && path.resolve(duplicate) !== path.resolve(fullPath)) {
-          throw new Error(`Memory ID already exists in ${path.relative(memoryDir, duplicate)}: @${id}`);
-        }
-
         const frontmatter: MemoryFrontmatter = {
           ...existing?.frontmatter,
-          id,
-          kind: inferredKind,
           description,
           created: existing?.frontmatter.created ?? today,
           updated: today,
           ...(tags && { tags }),
         };
+        delete frontmatter.id;
+        delete frontmatter.kind;
 
-        writeMemoryFile(fullPath, content, frontmatter);
+        writeMemoryFile(target.filePath, content, frontmatter);
+        upsertMemoryCatalog(memoryDir, target.filePath);
+        const relTarget = path.relative(memoryDir, target.filePath);
         return {
-          content: [{ type: "text", text: `Memory file written: ${relPath} (@${id})` }],
-          details: { path: fullPath, frontmatter },
+          content: [{ type: "text", text: `Memory file written: ${relTarget} (@${target.id})` }],
+          details: { path: target.filePath, frontmatter: { ...frontmatter, id: target.id, kind: target.kind } },
         };
       } catch (error) {
         return {
@@ -436,20 +431,23 @@ export function registerMemoryList(pi: ExtensionAPI, settings: MemoryMdSettings)
       const memoryDir = getMemoryDir(settings, ctx.cwd);
 
       try {
-        const listDir = directory ? resolveMemoryPath(memoryDir, directory) : memoryDir;
-        const entries = listMemoryFiles(listDir).map((filePath) => {
-          const memory = readMemoryFile(filePath);
-          return {
-            path: path.relative(memoryDir, filePath),
-            id: memory?.frontmatter.id,
-            kind: memory?.frontmatter.kind ?? inferMemoryKind(memoryDir, filePath),
-            description: memory?.frontmatter.description,
-          };
-        });
+        const normalizedDirectory = directory?.replace(/\/$/, "");
+        const entries = getMemoryCatalog(memoryDir)
+          .filter((entry) => {
+            if (!normalizedDirectory) return true;
+            if (normalizedDirectory === "state") return entry.kind === "state";
+            if (normalizedDirectory === "events") return entry.kind === "event";
+            return entry.path === normalizedDirectory || entry.path.startsWith(`${normalizedDirectory}/`);
+          })
+          .map((entry) => ({
+            path: entry.path,
+            id: entry.id,
+            kind: entry.kind,
+            description: entry.description,
+          }));
         const text = entries
           .map(
-            (entry) =>
-              `  - ${entry.path}${entry.id ? ` (@${entry.id})` : ""}\n    ${entry.kind ?? "legacy"}: ${entry.description ?? "No description"}`,
+            (entry) => `  - ${entry.path} (@${entry.id})\n    ${entry.kind}: ${entry.description ?? "No description"}`,
           )
           .join("\n");
         return {
@@ -506,15 +504,9 @@ export function registerMemorySearch(pi: ExtensionAPI, settings: MemoryMdSetting
         kind?: "state" | "event";
       };
       const memoryDir = getMemoryDir(settings, ctx.cwd);
-      const filePaths = listMemoryFiles(memoryDir);
-
-      // Build file map
       const fileMap = new Map<string, import("./types.js").MemoryFile>();
-      for (const filePath of filePaths) {
-        const memory = readMemoryFile(filePath);
-        if (!memory) continue;
-        const relPath = path.relative(memoryDir, filePath);
-        fileMap.set(relPath, memory);
+      for (const entry of getMemoryCatalog(memoryDir)) {
+        fileMap.set(entry.path, memoryFileFromCatalogEntry(memoryDir, entry));
       }
 
       const hits = searchMemoryFiles({ files: fileMap, query, searchIn, kind });
@@ -577,7 +569,7 @@ export function registerMemoryInit(
           {
             type: "text",
             text: result.success
-              ? `Memory repository initialized:\n${result.message}\n\nCreated project directories:\n  - state\n  - events`
+              ? `Memory repository initialized:\n${result.message}\n\nCreated project directory:\n  - records`
               : `Initialization failed: ${result.message}`,
           },
         ],

@@ -11,11 +11,13 @@ Use Memory as an auxiliary, project-scoped channel. It does not manage tasks and
 
 ```text
 projects/<project-slug>/
-├── state/
-└── events/
+├── records/
+│   ├── state.preferences.md
+│   └── event.local-extension-investigation.md
+└── .catalog.json
 ```
 
-### `state/`
+### `state.*` records
 
 Store only canonical knowledge that remains current:
 
@@ -26,7 +28,7 @@ Store only canonical knowledge that remains current:
 
 Keep this set small. Update an existing file instead of creating snapshots.
 
-### `events/`
+### `event.*` records
 
 Store atomic, time-bound material:
 
@@ -39,7 +41,7 @@ Prefer one topic or result per file.
 
 ## Writing
 
-Use `memory_write` for both create and full replacement. Paths must begin with `state/` or `events/`.
+Use `memory_write` for both create and full replacement. For ergonomics, pass logical paths under `state/` or `events/`; new writes are stored as identity-addressed `records/<stable-id>.md` files.
 
 ```text
 memory_write({
@@ -51,7 +53,7 @@ memory_write({
 })
 ```
 
-The extension generates a stable project-local ID on first write and preserves it on later writes. Do not create a new file merely to update canonical state.
+The extension generates the stable ID from the logical path. For example, `events/local-extension-investigation.md` becomes `@event.local-extension-investigation` stored at `records/event.local-extension-investigation.md`. Do not create a new file merely to update canonical state.
 
 ## Reading
 
@@ -73,8 +75,6 @@ Use `memory_list` for metadata and `memory_search` for on-demand retrieval. Sess
 
 Managed fields are:
 
-- `id`: stable dotted lowercase ID;
-- `kind`: `state` or `event`;
 - `description`: concise retrieval summary;
 - `tags`: optional labels;
 - `created`: creation date;
@@ -102,8 +102,8 @@ Rules:
 
 ## Choosing a destination
 
-- Still-current truth that should be updated in place → `state/`.
-- A report or finding tied to an investigation or point in time → `events/`.
+- Still-current truth that should be updated in place → logical `state/` path / `state.*` ID.
+- A report or finding tied to an investigation or point in time → logical `events/` path / `event.*` ID.
 - Temporary scratch data with no durable value → do not write to Memory.
 
 Memory and task-management records may overlap in facts, but neither system should assume the other exists.

@@ -289,7 +289,7 @@ export default function memoryMdExtension(pi: ExtensionAPI) {
       if (alreadyInitialized) {
         ctx.ui.notify(`Memory already exists: ${result.message}`, "info");
       } else {
-        ctx.ui.notify(`Memory initialized: ${result.message}\n\nCreated:\n  - state\n  - events`, "info");
+        ctx.ui.notify(`Memory initialized: ${result.message}\n\nCreated:\n  - records`, "info");
       }
     },
   });

@@ -28,15 +28,17 @@ Each Git workspace gets an isolated project directory derived from its Git root 
 ~/.pi/memory-md/
 └── projects/
     └── <project-slug>/
-        ├── state/
-        │   ├── identity.md
-        │   └── preferences.md
-        └── events/
+        ├── records/
+        │   ├── state.identity.md
+        │   └── event.runtime-investigation.md
+        └── .catalog.json
 ```
 
-- `state/`: a small set of canonical facts that are still current, such as preferences, environment, architecture, and active workflow.
-- `events/`: atomic reports, research, investigations, benchmarks, and historical findings.
-- The extension injects metadata for only the 10 most recently updated files across both directories.
+- `state.*` IDs: canonical facts that are still current, such as preferences, environment, architecture, and active workflow.
+- `event.*` IDs: atomic reports, research, investigations, benchmarks, and historical findings.
+- New writes are identity-addressed records. For ergonomic calls, `memory_write(path="events/foo.md", kind="event", ...)` writes `records/event.foo.md`.
+- `.catalog.json` is a rebuildable local catalog used for fast `@id` lookup, listing, latest-memory context, and search.
+- The extension injects metadata for only the 10 most recently updated catalog entries.
 - Full Markdown content is loaded on demand with `memory_read` or `memory_search`.
 
 ## Tools
@@ -47,7 +49,7 @@ Each Git workspace gets an isolated project directory derived from its Git root 
 | `memory_write` | Create or fully replace one memory file |
 | `memory_list` | List project memory metadata |
 | `memory_search` | Search content or metadata, optionally by kind |
-| `memory_init` | Initialize `state/` and `events/` |
+| `memory_init` | Initialize identity-addressed `records/` |
 | `memory_sync` | Pull, push, or inspect the backing repository |
 | `memory_migrate` | Rename a project or migrate a legacy project layout |
 | `memory_check` | Check project memory structure |
@@ -56,12 +58,10 @@ There is no append operation and no separate tape tool API.
 
 ## Frontmatter
 
-Every v2 memory has a stable project-local ID and kind:
+Every new memory record is addressed by its stable project-local filename. The ID and kind are inferred from `records/<id>.md`, so frontmatter does not need to repeat them:
 
 ```markdown
 ---
-id: "event.runtime-investigation"
-kind: "event"
 description: "Investigation of local extension loading"
 tags:
   - "runtime"
@@ -73,7 +73,7 @@ updated: "2026-07-11"
 Full Markdown report here.
 ```
 
-New IDs are generated from the path once and preserved when the file is updated. IDs can be used as `@event.runtime-investigation`.
+IDs can be used as `@event.runtime-investigation`. Legacy `state/` and `events/` files may still be read during compatibility, but new writes use `records/`.
 
 ## Optional fact block
 
@@ -97,13 +97,7 @@ Preview before applying:
 memory_migrate({ from: "Old Project", to: "Old Project", dryRun: true })
 ```
 
-Then run the same call without `dryRun`. The migration:
-
-- maps legacy identity/preferences to `state/`;
-- maps other legacy Markdown reports to `events/`;
-- adds v2 IDs and kinds while preserving content;
-- refuses conflicts and non-Markdown files;
-- removes the source only after all destination writes succeed.
+Then run the same call without `dryRun`. This is a compatibility path for old data: it may create readable legacy `state/` and `events/` files. New writes after initialization use `records/`.
 
 ## Configuration
 

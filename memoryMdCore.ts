@@ -608,6 +608,65 @@ export const MEMORY_FACTS_START = "<!-- memory:facts:v1 -->";
 export const MEMORY_FACTS_END = "<!-- /memory:facts -->";
 
 const MEMORY_KEY_PATTERN = /^[a-z][a-z0-9_.-]*$/;
+const MEMORY_RECORDS_DIR = "records";
+const MEMORY_CATALOG_FILE = ".catalog.json";
+const MEMORY_CATALOG_VERSION = 1;
+
+export interface MemoryCatalogEntry {
+  path: string;
+  id: string;
+  kind: MemoryKind;
+  description: string;
+  tags: string[];
+  created?: string;
+  updated?: string;
+  mtimeMs: number;
+  size: number;
+  content: string;
+}
+
+interface MemoryCatalog {
+  version: typeof MEMORY_CATALOG_VERSION;
+  entries: MemoryCatalogEntry[];
+}
+
+function normalizeMemoryId(id: string): string {
+  return id.startsWith("@") ? id.slice(1) : id;
+}
+
+function inferKindFromId(id: string): MemoryKind | null {
+  if (id.startsWith("state.")) return "state";
+  if (id.startsWith("event.")) return "event";
+  return null;
+}
+
+function recordPathForId(memoryDir: string, id: string): string {
+  return path.join(memoryDir, MEMORY_RECORDS_DIR, `${normalizeMemoryId(id)}.md`);
+}
+
+function recordIdFromPath(memoryDir: string, filePath: string): string | null {
+  const relative = path.relative(path.join(memoryDir, MEMORY_RECORDS_DIR), filePath);
+  if (relative.startsWith("..") || path.isAbsolute(relative) || !relative.endsWith(".md")) return null;
+  return relative.replace(/\.md$/i, "").split(path.sep).join(".");
+}
+
+function catalogPath(memoryDir: string): string {
+  return path.join(memoryDir, MEMORY_CATALOG_FILE);
+}
+
+function recordInfoFromFilePath(filePath: string): { id: string; kind: MemoryKind } | null {
+  const parts = path.normalize(filePath).split(path.sep);
+  const recordIndex = parts.lastIndexOf(MEMORY_RECORDS_DIR);
+  if (recordIndex < 0) return null;
+  const relativeParts = parts.slice(recordIndex + 1);
+  if (relativeParts.length === 0) return null;
+  const filename = relativeParts.at(-1);
+  if (!filename?.endsWith(".md")) return null;
+  relativeParts[relativeParts.length - 1] = filename.replace(/\.md$/i, "");
+  const id = relativeParts.join(".");
+  const kind = inferKindFromId(id);
+  return kind ? { id, kind } : null;
+}
 
 export function validateMemoryContent(content: string): { valid: boolean; error?: string } {
   const startCount = content.split(MEMORY_FACTS_START).length - 1;
@@ -692,11 +751,16 @@ export function readMemoryFile(filePath: string) {
   try {
     const content = fs.readFileSync(filePath, "utf-8");
     const parsed = parseFrontmatter(content);
+    const recordInfo = recordInfoFromFilePath(filePath);
 
     if (!parsed.data || Object.keys(parsed.data).length === 0) {
       return {
         path: filePath,
-        frontmatter: { description: "No description" },
+        frontmatter: {
+          id: recordInfo?.id,
+          kind: recordInfo?.kind,
+          description: "No description",
+        },
         content: content,
       };
     }
@@ -706,14 +770,23 @@ export function readMemoryFile(filePath: string) {
     if (!validation.valid) {
       return {
         path: filePath,
-        frontmatter: { description: "No description" },
+        frontmatter: {
+          id: recordInfo?.id,
+          kind: recordInfo?.kind,
+          description: "No description",
+        },
         content: content,
       };
     }
 
+    const frontmatter = parsed.data as unknown as MemoryFrontmatter;
     return {
       path: filePath,
-      frontmatter: parsed.data as unknown as MemoryFrontmatter,
+      frontmatter: {
+        ...frontmatter,
+        id: frontmatter.id ?? recordInfo?.id,
+        kind: frontmatter.kind ?? recordInfo?.kind,
+      },
       content: parsed.content,
     };
   } catch (error) {
@@ -756,6 +829,10 @@ export function inferMemoryKind(memoryDir: string, filePath: string): MemoryKind
   const [namespace] = path.relative(memoryDir, filePath).split(path.sep);
   if (namespace === "state") return "state";
   if (namespace === "events") return "event";
+  if (namespace === MEMORY_RECORDS_DIR) {
+    const id = recordIdFromPath(memoryDir, filePath);
+    return id ? inferKindFromId(id) : null;
+  }
   return null;
 }
 
@@ -773,8 +850,60 @@ export function createMemoryId(memoryDir: string, filePath: string, kind: Memory
   return [kind, ...segments].join(".");
 }
 
+function memoryIdFromRelativePath(memoryDir: string, relPath: string, kind: MemoryKind): string {
+  return createMemoryId(memoryDir, resolveMemoryPath(memoryDir, relPath), kind);
+}
+
+export function resolveMemoryWriteTarget(
+  memoryDir: string,
+  relPath: string,
+  requestedKind?: MemoryKind,
+  existingId?: string,
+  existingKind?: MemoryKind,
+  requireExistingId = false,
+  allowLegacyPath = false,
+): { filePath: string; id: string; kind: MemoryKind } {
+  if (!relPath.endsWith(".md")) throw new Error("Memory path must end with .md");
+  const resolvedPath = resolveMemoryPath(memoryDir, relPath);
+  const normalizedRel = path.relative(memoryDir, resolvedPath);
+  const [namespace] = normalizedRel.split(path.sep);
+
+  if (namespace === MEMORY_RECORDS_DIR) {
+    const id = recordIdFromPath(memoryDir, resolvedPath);
+    if (!id || !MEMORY_KEY_PATTERN.test(id)) throw new Error("Record path must be records/<stable-id>.md");
+    const kind = inferKindFromId(id);
+    if (!kind) throw new Error("Record ID must start with state. or event.");
+    if (requestedKind && requestedKind !== kind) {
+      throw new Error(`kind '${requestedKind}' does not match record lifecycle '${kind}'`);
+    }
+    return { filePath: resolvedPath, id, kind };
+  }
+
+  if (namespace !== "state" && namespace !== "events") {
+    throw new Error("Memory path must be under state/, events/, or records/");
+  }
+
+  const inferredKind = namespace === "state" ? "state" : "event";
+  if (requestedKind && requestedKind !== inferredKind) {
+    throw new Error(`kind '${requestedKind}' does not match path lifecycle '${inferredKind}'`);
+  }
+
+  const id = existingId ?? memoryIdFromRelativePath(memoryDir, normalizedRel, inferredKind);
+  if (requireExistingId && !existingId) throw new Error("Existing legacy file has no stable ID");
+  const kind = existingKind ?? inferredKind;
+  if (kind !== inferredKind) throw new Error(`Existing kind '${kind}' does not match path lifecycle '${inferredKind}'`);
+  return { filePath: allowLegacyPath ? resolvedPath : recordPathForId(memoryDir, id), id, kind };
+}
+
 export function findMemoryFileById(memoryDir: string, id: string): string | null {
-  const normalized = id.startsWith("@") ? id.slice(1) : id;
+  const normalized = normalizeMemoryId(id);
+  const recordPath = recordPathForId(memoryDir, normalized);
+  if (fs.existsSync(recordPath)) return recordPath;
+
+  for (const entry of getMemoryCatalog(memoryDir)) {
+    if (entry.id === normalized) return path.join(memoryDir, entry.path);
+  }
+
   for (const filePath of listMemoryFiles(memoryDir)) {
     const memory = readMemoryFile(filePath);
     if (memory?.frontmatter.id === normalized) return filePath;
@@ -788,7 +917,18 @@ export function resolveMemoryFile(memoryDir: string, pathOrId: string): string {
     if (!filePath) throw new Error(`Memory ID not found: ${pathOrId}`);
     return filePath;
   }
-  return resolveMemoryPath(memoryDir, pathOrId);
+
+  const filePath = resolveMemoryPath(memoryDir, pathOrId);
+  if (fs.existsSync(filePath)) return filePath;
+
+  const kind = inferMemoryKind(memoryDir, filePath);
+  if (kind) {
+    const id = createMemoryId(memoryDir, filePath, kind);
+    const recordPath = recordPathForId(memoryDir, id);
+    if (fs.existsSync(recordPath)) return recordPath;
+  }
+
+  return filePath;
 }
 
 export function writeMemoryFile(filePath: string, content: string, frontmatter: MemoryFrontmatter): void {
@@ -797,27 +937,119 @@ export function writeMemoryFile(filePath: string, content: string, frontmatter: 
   fs.writeFileSync(filePath, stringifyFrontmatter(content, frontmatter));
 }
 
+function catalogEntryFromMemory(memoryDir: string, filePath: string): MemoryCatalogEntry | null {
+  const memory = readMemoryFile(filePath);
+  if (!memory?.frontmatter.id || !memory.frontmatter.kind) return null;
+  const stats = fs.statSync(filePath);
+  return {
+    path: path.relative(memoryDir, filePath),
+    id: memory.frontmatter.id,
+    kind: memory.frontmatter.kind,
+    description: memory.frontmatter.description ?? "No description",
+    tags: memory.frontmatter.tags ?? [],
+    created: memory.frontmatter.created,
+    updated: memory.frontmatter.updated,
+    mtimeMs: stats.mtimeMs,
+    size: stats.size,
+    content: memory.content,
+  };
+}
+
+function memoryFromCatalogEntry(memoryDir: string, entry: MemoryCatalogEntry) {
+  return {
+    path: path.join(memoryDir, entry.path),
+    frontmatter: {
+      id: entry.id,
+      kind: entry.kind,
+      description: entry.description,
+      tags: entry.tags,
+      created: entry.created,
+      updated: entry.updated,
+    },
+    content: entry.content,
+  };
+}
+
+function readMemoryCatalog(memoryDir: string): MemoryCatalog | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(catalogPath(memoryDir), "utf-8")) as MemoryCatalog;
+    if (parsed.version !== MEMORY_CATALOG_VERSION || !Array.isArray(parsed.entries)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writeMemoryCatalog(memoryDir: string, entries: MemoryCatalogEntry[]): void {
+  fs.mkdirSync(memoryDir, { recursive: true });
+  fs.writeFileSync(
+    catalogPath(memoryDir),
+    `${JSON.stringify({ version: MEMORY_CATALOG_VERSION, entries }, null, 2)}\n`,
+  );
+}
+
+function catalogIsFresh(memoryDir: string, entries: MemoryCatalogEntry[]): boolean {
+  const files = listMemoryFiles(memoryDir);
+  if (files.length !== entries.length) return false;
+  const byPath = new Map(entries.map((entry) => [entry.path, entry]));
+  for (const filePath of files) {
+    const relPath = path.relative(memoryDir, filePath);
+    const entry = byPath.get(relPath);
+    if (!entry) return false;
+    const stats = fs.statSync(filePath);
+    if (entry.size !== stats.size || entry.mtimeMs !== stats.mtimeMs) return false;
+  }
+  return true;
+}
+
+export function rebuildMemoryCatalog(memoryDir: string): MemoryCatalogEntry[] {
+  const entries = listMemoryFiles(memoryDir)
+    .map((filePath) => catalogEntryFromMemory(memoryDir, filePath))
+    .filter((entry): entry is MemoryCatalogEntry => Boolean(entry))
+    .sort((a, b) => a.path.localeCompare(b.path));
+  writeMemoryCatalog(memoryDir, entries);
+  return entries;
+}
+
+export function getMemoryCatalog(memoryDir: string): MemoryCatalogEntry[] {
+  const catalog = readMemoryCatalog(memoryDir);
+  if (catalog && catalogIsFresh(memoryDir, catalog.entries)) return catalog.entries;
+  return rebuildMemoryCatalog(memoryDir);
+}
+
+export function upsertMemoryCatalog(memoryDir: string, filePath: string): void {
+  const entry = catalogEntryFromMemory(memoryDir, filePath);
+  if (!entry) return;
+  const catalog = readMemoryCatalog(memoryDir);
+  const entries =
+    catalog?.entries.filter((candidate) => candidate.path !== entry.path && candidate.id !== entry.id) ?? [];
+  entries.push(entry);
+  entries.sort((a, b) => a.path.localeCompare(b.path));
+  writeMemoryCatalog(memoryDir, entries);
+}
+
+export function memoryFileFromCatalogEntry(memoryDir: string, entry: MemoryCatalogEntry) {
+  return memoryFromCatalogEntry(memoryDir, entry);
+}
 /**
  * Memory context
  */
 
 function ensureDirectoryStructure(memoryDir: string): void {
-  for (const dir of [path.join(memoryDir, "state"), path.join(memoryDir, "events")]) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
+  fs.mkdirSync(path.join(memoryDir, MEMORY_RECORDS_DIR), { recursive: true });
 }
 
 function createDefaultFiles(memoryDir: string): void {
   const today = getCurrentDate();
-  const defaults: Array<{ name: string; description: string; tags: string[]; content: string }> = [
+  const defaults: Array<{ id: string; description: string; tags: string[]; content: string }> = [
     {
-      name: "identity.md",
+      id: "state.identity",
       description: "Project-specific user identity and background",
       tags: ["user", "identity"],
       content: `# User Identity\n\n${MEMORY_FACTS_START}\nuser.identity = "Customize this fact"\n${MEMORY_FACTS_END}`,
     },
     {
-      name: "preferences.md",
+      id: "state.preferences",
       description: "Project-specific user and collaboration preferences",
       tags: ["user", "preferences"],
       content: `# User Preferences\n\n${MEMORY_FACTS_START}\ncommunication.style = "concise"\n${MEMORY_FACTS_END}`,
@@ -825,16 +1057,15 @@ function createDefaultFiles(memoryDir: string): void {
   ];
 
   for (const entry of defaults) {
-    const filePath = path.join(memoryDir, "state", entry.name);
+    const filePath = recordPathForId(memoryDir, entry.id);
     if (fs.existsSync(filePath)) continue;
     writeMemoryFile(filePath, entry.content, {
-      id: createMemoryId(memoryDir, filePath, "state"),
-      kind: "state",
       description: entry.description,
       tags: entry.tags,
       created: today,
       updated: today,
     });
+    upsertMemoryCatalog(memoryDir, filePath);
   }
 }
 
@@ -855,15 +1086,11 @@ export function buildMemoryContext(settings: MemoryMdSettings, cwd: string): str
   const memoryDir = getMemoryDir(settings, cwd);
   if (!fs.existsSync(memoryDir)) return "";
 
-  const memories = listMemoryFiles(memoryDir)
-    .map((filePath) => ({ filePath, memory: readMemoryFile(filePath) }))
-    .filter((entry): entry is { filePath: string; memory: NonNullable<ReturnType<typeof readMemoryFile>> } =>
-      Boolean(entry.memory),
-    )
+  const memories = getMemoryCatalog(memoryDir)
     .sort(
       (a, b) =>
-        memoryTimestamp(b.filePath, b.memory.frontmatter) - memoryTimestamp(a.filePath, a.memory.frontmatter) ||
-        a.filePath.localeCompare(b.filePath),
+        memoryTimestamp(path.join(memoryDir, b.path), b) - memoryTimestamp(path.join(memoryDir, a.path), a) ||
+        a.path.localeCompare(b.path),
     )
     .slice(0, MAX_INJECTED_MEMORY_FILES);
   if (memories.length === 0) return "";
@@ -875,13 +1102,11 @@ export function buildMemoryContext(settings: MemoryMdSettings, cwd: string): str
     "",
   ];
 
-  for (const { filePath, memory } of memories) {
-    const relPath = path.relative(memoryDir, filePath);
-    const { id, kind, description, tags } = memory.frontmatter;
-    lines.push(`- ${relPath}${id ? ` (@${id})` : ""}`);
-    lines.push(`  Kind: ${kind ?? inferMemoryKind(memoryDir, filePath) ?? "legacy"}`);
-    lines.push(`  Description: ${description}`);
-    lines.push(`  Tags: ${tags?.join(", ") || "none"}`);
+  for (const entry of memories) {
+    lines.push(`- ${entry.path} (@${entry.id})`);
+    lines.push(`  Kind: ${entry.kind}`);
+    lines.push(`  Description: ${entry.description}`);
+    lines.push(`  Tags: ${entry.tags.join(", ") || "none"}`);
     lines.push("");
   }
 

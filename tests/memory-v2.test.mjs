@@ -7,13 +7,17 @@ import { parseFrontmatter, stringifyFrontmatter } from "../.test-dist/frontmatte
 import {
   buildMemoryContext,
   createMemoryId,
+  findMemoryFileById,
+  getMemoryCatalog,
   getMemoryDir,
   MEMORY_FACTS_END,
   MEMORY_FACTS_START,
   migrateMemoryProject,
   readMemoryFile,
   resolveMemoryPath,
+  resolveMemoryWriteTarget,
   syncRepository,
+  upsertMemoryCatalog,
   validateMemoryContent,
   writeMemoryFile,
 } from "../.test-dist/memoryMdCore.js";
@@ -114,6 +118,32 @@ test("legacy project migration dry-runs then moves reports into Memory v2", () =
     assert.equal(fs.existsSync(legacyRoot), false);
     assert.equal(readMemoryFile(path.join(projectRoot, "state", "preferences.md")).frontmatter.id, "state.preferences");
     assert.equal(readMemoryFile(path.join(projectRoot, "events", "report.md")).frontmatter.kind, "event");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("new writes use identity-addressed records with inferred metadata", () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const memoryDir = getMemoryDir(settings, workspace);
+    const target = resolveMemoryWriteTarget(memoryDir, "events/size-report.md", "event");
+    assert.equal(target.id, "event.size-report");
+    assert.equal(path.relative(memoryDir, target.filePath), path.join("records", "event.size-report.md"));
+
+    writeMemoryFile(target.filePath, "# Size report", {
+      description: "Size report",
+      tags: ["benchmark"],
+      created: "2026-07-11",
+      updated: "2026-07-11",
+    });
+    upsertMemoryCatalog(memoryDir, target.filePath);
+
+    const memory = readMemoryFile(target.filePath);
+    assert.equal(memory.frontmatter.id, "event.size-report");
+    assert.equal(memory.frontmatter.kind, "event");
+    assert.equal(findMemoryFileById(memoryDir, "@event.size-report"), target.filePath);
+    assert.equal(getMemoryCatalog(memoryDir).at(0).path, path.join("records", "event.size-report.md"));
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
