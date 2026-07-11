@@ -288,7 +288,7 @@ export function searchMemoryFiles(input: SearchInput): SearchHit[] {
     return hits.slice(0, MAX_SEARCH_RESULTS);
   }
 
-  const exactConceptTerms = rawQuery.split(/\s+/).filter((term) => /^[a-z0-9]+(?:-[a-z0-9]+)+$/.test(term));
+  const exactConceptTerms = rawQuery.split(/\s+/).filter((term) => /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(term));
   if (
     searchIn === "concepts" &&
     exactConceptTerms.length > 0 &&

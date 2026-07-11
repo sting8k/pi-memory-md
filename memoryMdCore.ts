@@ -859,15 +859,15 @@ export function normalizeConceptSearchQuery(memoryDir: string, query: string): s
   if (query.includes(",")) {
     const parts = query.split(",").map((part) => part.trim());
     const normalized = parts
-      .map((part) => resolveKnownConcept(dictionary, part))
-      .filter((part): part is string => Boolean(part));
-    return normalized.length === parts.length ? uniqueSorted(normalized).join(" ") : query;
+      .map((part) => resolveKnownConcept(dictionary, part) ?? normalizeConceptLabel(part))
+      .filter(Boolean);
+    return uniqueSorted(normalized).join(" ");
   }
 
   const whole = resolveKnownConcept(dictionary, query);
   if (whole) return whole;
   const sequence = normalizeKnownConceptSequence(dictionary, query);
-  return sequence ? uniqueSorted(sequence).join(" ") : query;
+  return sequence ? uniqueSorted(sequence).join(" ") : normalizeConceptLabel(query);
 }
 function isMemoryFactValue(value: unknown): value is MemoryFactValue {
   if (value === null) return true;
@@ -1344,19 +1344,28 @@ export function removeMemoryCatalogEntry(memoryDir: string, filePath: string): v
   writeMemoryCatalog(memoryDir, entries);
 }
 
-export function reconcileConceptDictionary(memoryDir: string): ConceptDictionary {
+export function reconcileConceptDictionary(memoryDir: string, removableConcepts: string[] = []): ConceptDictionary {
   const existing = getConceptDictionary(memoryDir);
-  const concepts = new Set<string>(
-    Object.values(existing.aliases)
-      .map((target) => normalizeConceptLabel(target))
-      .filter(Boolean),
-  );
+  const activeConcepts = new Set<string>();
   for (const filePath of listMemoryFiles(memoryDir)) {
     const memory = readMemoryFile(filePath);
     for (const concept of memory?.frontmatter.concepts ?? []) {
       const normalized = normalizeConceptLabel(concept);
-      if (normalized) concepts.add(normalized);
+      if (normalized) activeConcepts.add(normalized);
     }
+  }
+
+  const aliasTargets = new Set(
+    Object.values(existing.aliases)
+      .map((target) => normalizeConceptLabel(target))
+      .filter(Boolean),
+  );
+  const removable = new Set(removableConcepts.map((concept) => normalizeConceptLabel(concept)).filter(Boolean));
+  const concepts = new Set<string>(existing.concepts.map((concept) => normalizeConceptLabel(concept)).filter(Boolean));
+  for (const concept of activeConcepts) concepts.add(concept);
+  for (const concept of aliasTargets) concepts.add(concept);
+  for (const concept of removable) {
+    if (!activeConcepts.has(concept) && !aliasTargets.has(concept)) concepts.delete(concept);
   }
 
   const dictionary: ConceptDictionary = {
@@ -1377,7 +1386,7 @@ export function deleteMemoryFile(
   if (!memory?.frontmatter.id || !memory.frontmatter.kind) throw new Error(`Memory file not found: ${pathOrId}`);
   fs.rmSync(filePath, { force: true });
   removeMemoryCatalogEntry(memoryDir, filePath);
-  const dictionary = reconcileConceptDictionary(memoryDir);
+  const dictionary = reconcileConceptDictionary(memoryDir, memory.frontmatter.concepts ?? []);
   return { id: memory.frontmatter.id, path: path.relative(memoryDir, filePath), dictionary };
 }
 /**

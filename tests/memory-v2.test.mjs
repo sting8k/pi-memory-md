@@ -245,7 +245,7 @@ test("concept dictionary normalizes aliases and registers safe new concepts", ()
       normalizeConceptSearchQuery(memoryDir, "id based record knowledge view"),
       "identity-addressed-record semantic-projection",
     );
-    assert.equal(normalizeConceptSearchQuery(memoryDir, "free form query"), "free form query");
+    assert.equal(normalizeConceptSearchQuery(memoryDir, "free form query"), "free-form-query");
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -330,6 +330,14 @@ test("memory tools normalize concepts transparently", async () => {
     assert.equal(multiConceptSearch.details.query, "identity-addressed-record semantic-projection");
     assert.equal(multiConceptSearch.details.count, 1);
     assert.equal(multiConceptSearch.details.results[0].path, path.join("records", "event.concept-tool.md"));
+
+    const unknownConceptSearch = await tools
+      .get("memory_search")
+      .execute("search-3", { query: "unknown cleanup live orphan token", searchIn: "concepts" }, signal, () => {}, {
+        cwd: workspace,
+      });
+    assert.equal(unknownConceptSearch.details.query, "unknown-cleanup-live-orphan-token");
+    assert.equal(unknownConceptSearch.details.count, 0);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -379,7 +387,7 @@ test("memory delete removes records and reconciles derived metadata", async () =
 
     const dictionary = getConceptDictionary(memoryDir);
     assert.deepEqual(dictionary.aliases, { "legacy-cleanup": "alias-target" });
-    assert.deepEqual(dictionary.concepts, ["alias-target", "kept-concept"]);
+    assert.deepEqual(dictionary.concepts, ["alias-target", "kept-concept", "unused-concept"]);
 
     const { pi, tools } = fakePi();
     registerMemoryDelete(pi, settings);
@@ -397,7 +405,7 @@ test("structured memory records support compact semantic read and search", () =>
     const content = buildStructuredMemoryContent({
       description: "Structured benchmark",
       summary: "V3 optimizes semantic memory reads with compact projections",
-      concepts: ["identity-addressed records", "semantic projection"],
+      concepts: ["identity-addressed-record", "semantic-projection"],
       claims: ["Structured records avoid loading prose when facts are enough"],
       facts: { "benchmark.v3.write_ms": 0.269, "benchmark.sizes": [50, 1000, 10000] },
       relations: { implementation: "@event.memory-v3" },
@@ -408,7 +416,7 @@ test("structured memory records support compact semantic read and search", () =>
     writeMemoryFile(target.filePath, content, {
       description: "Structured benchmark",
       summary: "V3 optimizes semantic memory reads with compact projections",
-      concepts: ["identity-addressed records", "semantic projection"],
+      concepts: ["identity-addressed-record", "semantic-projection"],
       claims: ["Structured records avoid loading prose when facts are enough"],
       tags: ["memory-v4", "structured"],
       created: "2026-07-11",
@@ -423,7 +431,7 @@ test("structured memory records support compact semantic read and search", () =>
 
     const catalogEntry = getMemoryCatalog(memoryDir).at(0);
     assert.equal(catalogEntry.summary, "V3 optimizes semantic memory reads with compact projections");
-    assert.deepEqual(catalogEntry.concepts, ["identity-addressed records", "semantic projection"]);
+    assert.deepEqual(catalogEntry.concepts, ["identity-addressed-record", "semantic-projection"]);
     assert.equal("content" in catalogEntry, false);
     assert.equal("facts" in catalogEntry, false);
     assert.equal("relations" in catalogEntry, false);
@@ -442,7 +450,7 @@ test("structured memory records support compact semantic read and search", () =>
 
     const hits = searchMemoryFiles({
       files: new Map([[catalogEntry.path, memoryFileFromCatalogEntry(memoryDir, catalogEntry)]]),
-      query: "semantic projection",
+      query: normalizeConceptSearchQuery(memoryDir, "semantic projection"),
       searchIn: "concepts",
     });
     assert.equal(hits[0].path, path.join("records", "event.structured-benchmark.md"));

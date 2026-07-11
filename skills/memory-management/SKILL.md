@@ -42,7 +42,7 @@ Prefer one topic or result per file.
 
 ## Writing
 
-Use `memory_write` for both create and full replacement. Prefer structured semantic fields over long prose: `summary`, `concepts`, `claims`, `facts`, `relations`, and optional `notes`. For ergonomics, pass logical paths under `state/` or `events/`; new writes are stored as identity-addressed `records/<stable-id>.md` files. Generated Markdown does not repeat summary, concepts, or claims in the body; read projections render them from frontmatter.
+Use `memory_write` for both create and full replacement. Prefer structured semantic fields over long prose: `summary`, `concepts`, `claims`, `facts`, `relations`, and optional `notes`. For ergonomics, pass logical paths under `state/` or `events/`; new writes are stored as identity-addressed `records/<stable-id>.md` files.
 
 ```text
 memory_write({
@@ -61,9 +61,6 @@ memory_write({
 
 The extension generates the stable ID from the logical path. For example, `events/local-extension-investigation.md` becomes `@event.local-extension-investigation` stored at `records/event.local-extension-investigation.md`. Do not create a new file merely to update canonical state.
 
-Concepts are normalized transparently through `.concepts.json`: use natural labels, and the tool lowercases/kebab-cases them, resolves known aliases, deduplicates them, and auto-registers new concepts. Ambiguous near-duplicates are returned as advisory details; they do not block writes.
-
-`memory_write` also sets ISO `created`/`updated` timestamps automatically, so same-day memories still sort by write time.
 
 ## Reading
 
@@ -85,7 +82,7 @@ Views:
 - `knowledge`: summary, concepts, claims, facts, relations;
 - `full`: full Markdown including optional notes/prose.
 
-Use `memory_list` for metadata and `memory_search` for on-demand retrieval. `memory_search({ searchIn: "concepts" })` is alias-aware. Session injection contains metadata for only the 10 most recently updated memories, not full content. `.catalog.json` is a rebuildable slim metadata index, not a second copy of full Markdown.
+Use `memory_list` for metadata and `memory_search` for on-demand retrieval. Session injection contains metadata for only the 10 most recently updated memories, not full content.
 
 ## Frontmatter
 
@@ -96,12 +93,12 @@ Managed fields are:
 - `concepts`: retrieval concepts;
 - `claims`: decisions or conclusions;
 - `tags`: optional labels;
-- `created`: ISO creation timestamp;
-- `updated`: ISO timestamp for the last meaningful update.
+- `created`: creation timestamp;
+- `updated`: timestamp for the last meaningful update.
 
 ## Cleanup
 
-Use `memory_delete({ path: "@event.foo" })` only for explicit destructive cleanup. It deletes the record, updates the slim catalog, and reconciles `.concepts.json` while preserving aliases and alias targets.
+Use `memory_delete({ path: "@event.foo" })` only for explicit destructive cleanup.
 
 ## Optional facts
 
