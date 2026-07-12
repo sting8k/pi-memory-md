@@ -397,6 +397,26 @@ test("memory delete removes records and reconciles derived metadata", async () =
   }
 });
 
+test("structured memory facts normalize nested objects and keys", () => {
+  const content = buildStructuredMemoryContent({
+    description: "Nested benchmark",
+    facts: {
+      task_times: { T2_seconds: 72, "Review score": "3/9" },
+      "Run ID": "olm-glm-5.2",
+    },
+    relations: { "Evidence Link": "event.memory-v3" },
+  });
+
+  assert.deepEqual(validateMemoryContent(content), { valid: true });
+  const semantic = parseMemoryFacts(content);
+  assert.deepEqual(semantic.facts, {
+    "task_times.t2_seconds": 72,
+    "task_times.review_score": "3/9",
+    run_id: "olm-glm-5.2",
+  });
+  assert.equal(semantic.relations["relation.evidence_link"], "@event.memory-v3");
+});
+
 test("structured memory records support compact semantic read and search", () => {
   const { root, workspace, settings } = fixture();
   try {

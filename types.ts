@@ -8,12 +8,13 @@ export type MemoryKind = "state" | "event";
 export type MemoryReadView = "full" | "summary" | "knowledge";
 
 export type MemoryFactValue = string | number | boolean | null | Array<string | number | boolean | null>;
+export type MemoryFactInputValue = MemoryFactValue | { [key: string]: MemoryFactInputValue };
 
 export interface StructuredMemoryFields {
   summary?: string;
   concepts?: string[];
   claims?: string[];
-  facts?: Record<string, MemoryFactValue>;
+  facts?: Record<string, MemoryFactInputValue>;
   relations?: Record<string, string>;
   notes?: string;
 }

@@ -930,18 +930,90 @@ export function parseMemoryFacts(content: string): {
   return { facts, relations };
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function normalizeMemoryFactKey(key: string): string {
+  return key
+    .trim()
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/\s+/g, "_")
+    .replace(/[^A-Za-z0-9_.-]+/g, "_")
+    .toLowerCase();
+}
+
+function assertUniqueMemoryFactKey(seen: Map<string, string>, key: string, source: string): void {
+  const existing = seen.get(key);
+  if (existing) throw new Error(`Duplicate memory fact key after normalization: ${source} conflicts with ${existing}`);
+  seen.set(key, source);
+}
+
+function normalizeStructuredFacts(facts: Record<string, unknown> = {}): Record<string, MemoryFactValue> {
+  const normalized: Record<string, MemoryFactValue> = {};
+  const seen = new Map<string, string>();
+
+  function visit(value: unknown, sourceKey: string, normalizedKey: string): void {
+    if (isPlainObject(value)) {
+      for (const [childKey, childValue] of Object.entries(value)) {
+        const childNormalizedKey = normalizeMemoryFactKey(childKey);
+        visit(
+          childValue,
+          `${sourceKey}.${childKey}`,
+          normalizedKey ? `${normalizedKey}.${childNormalizedKey}` : childNormalizedKey,
+        );
+      }
+      return;
+    }
+
+    if (!MEMORY_KEY_PATTERN.test(normalizedKey)) {
+      throw new Error(`Invalid memory fact key after normalization: ${sourceKey} -> ${normalizedKey}`);
+    }
+    if (!isMemoryFactValue(value)) throw new Error(`Memory fact values cannot be objects: ${normalizedKey}`);
+    assertUniqueMemoryFactKey(seen, normalizedKey, sourceKey);
+    normalized[normalizedKey] = value;
+  }
+
+  for (const [key, value] of Object.entries(facts)) {
+    visit(value, key, normalizeMemoryFactKey(key));
+  }
+
+  return normalized;
+}
+
 function normalizeRelationKey(key: string): string {
-  return key.startsWith("relation.") ? key : `relation.${key}`;
+  const normalized = normalizeMemoryFactKey(key);
+  return normalized.startsWith("relation.") ? normalized : `relation.${normalized}`;
+}
+
+function normalizeStructuredRelations(relations: Record<string, string> = {}): Record<string, string> {
+  const normalized: Record<string, string> = {};
+  const seen = new Map<string, string>();
+
+  for (const [key, target] of Object.entries(relations)) {
+    const normalizedKey = normalizeRelationKey(key);
+    if (!MEMORY_KEY_PATTERN.test(normalizedKey)) {
+      throw new Error(`Invalid memory relation key after normalization: ${key} -> ${normalizedKey}`);
+    }
+    assertUniqueMemoryFactKey(seen, normalizedKey, key);
+    const normalizedTarget = target.trim();
+    normalized[normalizedKey] = normalizedTarget.startsWith("@") ? normalizedTarget : `@${normalizedTarget}`;
+  }
+
+  return normalized;
 }
 
 export function buildStructuredMemoryContent(fields: StructuredMemoryFields & { description: string }): string {
   const lines: string[] = [`# ${fields.summary ?? fields.description}`];
+  const normalizedFacts = normalizeStructuredFacts(fields.facts);
+  const normalizedRelations = normalizeStructuredRelations(fields.relations);
 
   const factLines = [
-    ...Object.entries(fields.facts ?? {}).map(([key, value]) => `${key} = ${JSON.stringify(value)}`),
-    ...Object.entries(fields.relations ?? {}).map(
-      ([key, target]) => `${normalizeRelationKey(key)} -> ${target.startsWith("@") ? target : `@${target}`}`,
-    ),
+    ...Object.entries(normalizedFacts).map(([key, value]) => `${key} = ${JSON.stringify(value)}`),
+    ...Object.entries(normalizedRelations).map(([key, target]) => `${key} -> ${target}`),
   ];
   if (factLines.length) lines.push("", MEMORY_FACTS_START, ...factLines, MEMORY_FACTS_END);
   if (fields.notes) lines.push("", "## Notes", fields.notes);

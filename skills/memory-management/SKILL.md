@@ -114,8 +114,8 @@ relation.evidence -> @event.local-extension-investigation
 
 Rules:
 
-- keys are dotted lowercase identifiers;
-- values are JSON scalars or arrays;
+- structured writes normalize fact/relation keys to dotted lowercase identifiers and flatten nested plain-object facts;
+- values are JSON scalars or arrays after flattening;
 - relations point to stable `@id` values;
 - only one fact block is allowed per file;
 - Markdown outside the block is unrestricted.

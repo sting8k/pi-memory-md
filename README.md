@@ -88,7 +88,7 @@ Prefer structured semantic fields over long prose. `memory_write` can generate c
 - `concepts`: retrieval concepts;
   Concepts are normalized to canonical lowercase kebab-case labels through `.concepts.json`; known aliases resolve automatically and unknown concepts are auto-registered. Ambiguous near-duplicates are reported as hints, not blocked.
 - `claims`: decisions or conclusions;
-- `facts`: JSON scalar/array values rendered into the facts block;
+- `facts`: JSON scalar/array values rendered into the facts block; nested plain objects are flattened to dotted keys and keys are normalized to lowercase identifiers;
 - `relations`: stable `@id` links rendered as relation facts;
 - `notes`: optional evidence/prose loaded only in full view.
 
@@ -102,7 +102,7 @@ relation.follow_up -> @event.next-investigation
 <!-- /memory:facts -->
 ```
 
-Fact values must be JSON scalars or arrays. Relations must point to a valid stable `@id`. Use `memory_read({ path: "@event.foo", view: "knowledge" })` to retrieve summary, concepts, claims, facts, and relations without optional notes/prose.
+Fact values must be JSON scalars or arrays. For structured writes, nested plain objects are flattened to dotted fact keys, and fact/relation keys are normalized to lowercase identifiers before validation. Relations must point to a valid stable `@id`. Use `memory_read({ path: "@event.foo", view: "knowledge" })` to retrieve summary, concepts, claims, facts, and relations without optional notes/prose.
 
 ## Concept normalization
 
