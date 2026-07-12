@@ -11,9 +11,17 @@ Understand -> Implement -> Verify -> Report
 1. Understand the requested outcome, relevant design, constraints, and likely proof.
 2. Implement the smallest change that fits the design.
 3. Run focused proof and adjacent regression checks appropriate to the risk.
-4. Report the outcome, evidence, and any unverified gap.
+4. Complete the applicable completion contract below, then report the outcome, evidence, and any unverified gap.
 
-Add process or durable records only when they preserve knowledge across sessions, coordinate actors, or prevent a recurring failure.
+## Completion Contract
+
+Treat completion as a contract. Before reporting a change as complete, reconcile each applicable clause:
+
+- **Owning documentation**: if behavior, schema, architecture, or operator usage changed, update the document that owns that contract so it remains accurate.
+- **Durable decision**: if the work settles a consequential choice about behavior, architecture, authorization, data ownership, public contracts, or validation that future work must inherit, update or create one decision record.
+- **Durable evidence**: if release, benchmark, failure attribution, handoff, or durable acceptance requires retained evidence, record one evidence-focused trace.
+
+A clause that does not apply creates no artifact. Do not create placeholder records or duplicate facts already clear from accepted contracts, the diff, or executable proof. Routine narrow changes can still remain direct work.
 
 ## Proportional Structure
 
@@ -40,11 +48,11 @@ A delegated result is provisional until the integrating actor verifies the paren
 
 ### Decisions
 
-Record a durable decision when future work must inherit a consequential choice about behavior, architecture, authorization, data ownership, public contracts, or validation requirements. Routine implementation choices do not need decision records.
+When work settles a consequential choice that future work must inherit, update the owning decision or create one if none exists. Routine implementation choices do not need decision records.
 
 ### Traces
 
-Record a trace when durable execution evidence, failure attribution, benchmark/release review, or handoff is useful. Keep it evidence-focused. Do not restate information already clear from the diff or test output unless the context is needed to interpret it. See `docs/TRACE_SPEC.md`.
+Record a trace when release, benchmark, failure attribution, handoff, or durable acceptance requires retained evidence. Keep it evidence-focused, and do not restate information already clear from the diff or test output unless context is needed to interpret it. See `docs/TRACE_SPEC.md`.
 
 ## Risk and Proof
 
@@ -87,7 +95,7 @@ scripts/bin/harness-cli query   backlog
 scripts/bin/harness-cli query   stats
 ```
 
-Use the CLI for a record only when that record is useful. Do not create records to satisfy a sequence.
+Use the CLI only for a record required by the completion contract or a coordination boundary. Do not create records merely to satisfy a sequence.
 
 ## Source Hierarchy
 

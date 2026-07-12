@@ -3,7 +3,7 @@ dist/
 *.log
 .DS_Store
 *.tgz
-.pi/
+.pi
 test-search-compare.ts
 
 # Harness durable layer

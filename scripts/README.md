@@ -195,16 +195,18 @@ Windows artifact includes the `.exe` suffix. Supported labels are:
 - `linux-arm64`
 - `windows-x64`
 
-For cross-compilation, pass a Cargo target triple:
+For cross-compilation, pass a Cargo target triple. Linux release artifacts use
+musl targets so the installed CLI does not inherit the GitHub runner's glibc
+floor:
 
 ```bash
-scripts/build-harness-cli-release.sh --target x86_64-unknown-linux-gnu
+scripts/build-harness-cli-release.sh --target x86_64-unknown-linux-musl
 ```
 
 GitHub releases are produced by
 `.github/workflows/harness-cli-release.yml`. Push a tag matching `v*` or
-`harness-cli-v*` to run the verification job, build all supported targets on
-native hosted runners, and upload these release assets:
+`harness-cli-v*` to run the verification job, build macOS/Windows targets with
+native toolchains and Linux targets with musl, then upload these release assets:
 
 - `harness-cli-macos-arm64`
 - `harness-cli-macos-arm64.sha256`

@@ -36,7 +36,10 @@ On Windows, the repository-local binary is installed as:
 ```
 
 The installer should download, verify, and install the platform-specific Rust
-binary directly at that path. There should be no shell wrapper command contract.
+binary directly at that path. Linux release artifacts should be built with musl
+targets while keeping the stable `linux-x64` and `linux-arm64` asset names, so
+installed CLIs do not inherit the release runner's glibc floor. There should be
+no shell wrapper command contract.
 
 The Rust CLI should follow the existing architecture rules:
 
@@ -68,6 +71,7 @@ Positive:
 - The `scripts/bin/harness-cli` command is the stable entrypoint for agents on
   macOS/Linux; Windows uses the same repo-local path with the `.exe` suffix.
 - Prebuilt releases can include a known SQLite linkage strategy.
+- Linux installs avoid coupling the CLI to the GitHub runner's glibc version.
 
 Tradeoffs:
 
