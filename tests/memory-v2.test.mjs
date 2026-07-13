@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import { parseFrontmatter, stringifyFrontmatter } from "../.test-dist/frontmatter.js";
 import {
   buildMemoryContext,
@@ -52,6 +53,196 @@ function fakePi() {
     },
   };
 }
+
+initTheme(undefined, false);
+
+const renderTheme = {
+  fg: (role, text) => `[${role}]${text}[/${role}]`,
+  bold: (text) => text,
+};
+
+function renderToolText(component) {
+  return component.render(500).join("\n");
+}
+
+test("memory_write create keeps plain success without diff", async () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const { pi, tools } = fakePi();
+    registerMemoryWrite(pi, settings);
+    const signal = new AbortController().signal;
+
+    const result = await tools.get("memory_write").execute(
+      "write-create",
+      {
+        path: "events/create-diff.md",
+        kind: "event",
+        description: "Create diff test",
+        content: "# Created\n",
+      },
+      signal,
+      () => {},
+      { cwd: workspace },
+    );
+
+    assert.equal(result.details.operation, "create");
+    assert.equal(result.details.diff, undefined);
+    assert.match(
+      result.content[0].text,
+      /^Memory file written: records\/event\.create-diff\.md \(@event\.create-diff\)$/,
+    );
+    assert.doesNotMatch(result.content[0].text, /overwritten|── diff ──/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("memory_write overwrite diff preserves a terminal-newline change", async () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const { pi, tools } = fakePi();
+    registerMemoryWrite(pi, settings);
+    const tool = tools.get("memory_write");
+    const signal = new AbortController().signal;
+
+    await tool.execute(
+      "write-no-terminal-newline",
+      {
+        path: "events/terminal-newline.md",
+        kind: "event",
+        description: "Terminal newline test",
+        content: "# Terminal newline",
+      },
+      signal,
+      () => {},
+      { cwd: workspace },
+    );
+    const result = await tool.execute(
+      "write-with-terminal-newline",
+      {
+        path: "events/terminal-newline.md",
+        kind: "event",
+        description: "Terminal newline test",
+        content: "# Terminal newline\n",
+      },
+      signal,
+      () => {},
+      { cwd: workspace },
+    );
+
+    assert.equal(result.details.operation, "overwrite");
+    assert.equal(result.details.diff.newLines.at(-1), "");
+    assert.equal(result.content[0].text.endsWith("\n+ "), true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("memory_write overwrite response includes compact diff and renderer stats", async () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const { pi, tools } = fakePi();
+    registerMemoryWrite(pi, settings);
+    const tool = tools.get("memory_write");
+    const signal = new AbortController().signal;
+
+    await tool.execute(
+      "write-before",
+      {
+        path: "events/overwrite-diff.md",
+        kind: "event",
+        description: "Overwrite diff test",
+        summary: "First summary",
+        claims: ["first claim"],
+      },
+      signal,
+      () => {},
+      { cwd: workspace },
+    );
+    const result = await tool.execute(
+      "write-after",
+      {
+        path: "events/overwrite-diff.md",
+        kind: "event",
+        description: "Overwrite diff test",
+        summary: "Second summary",
+        claims: ["second claim"],
+      },
+      signal,
+      () => {},
+      { cwd: workspace },
+    );
+
+    const text = result.content[0].text;
+    assert.equal(result.details.operation, "overwrite");
+    assert.match(text, /^Memory file overwritten: records\/event\.overwrite-diff\.md \(@event\.overwrite-diff\)/);
+    assert.match(text, /── diff ──\n:\d+(?:-\d+)?/);
+    assert.match(text, /- summary: "First summary"/);
+    assert.match(text, /\+ summary: "Second summary"/);
+    assert.match(text, /- # First summary/);
+    assert.match(text, /\+ # Second summary/);
+    assert.equal(result.details.diff.text, text.split("\n\n")[1]);
+    assert.equal(result.details.diff.additions, result.details.diff.newLines.length);
+    assert.equal(result.details.diff.removals, result.details.diff.oldLines.length);
+
+    const collapsed = renderToolText(tool.renderResult(result, { expanded: false, isPartial: false }, renderTheme));
+    assert.match(collapsed, new RegExp(`\\[success\\]\\+${result.details.diff.additions}\\[/success\\]`));
+    assert.match(collapsed, new RegExp(`\\[error\\]-${result.details.diff.removals}\\[/error\\]`));
+    assert.match(collapsed, /overwrite/);
+    assert.match(collapsed, new RegExp(`\\(${text.split("\n").length} more lines,`));
+
+    const expanded = renderToolText(tool.renderResult(result, { expanded: true, isPartial: false }, renderTheme));
+    assert.match(expanded, /\[success\]\+ summary: "Second summary"\[\/success\]/);
+    assert.match(expanded, /\[error\]- summary: "First summary"\[\/error\]/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("memory_write overwrite diff can use compatible legacy existing markdown", async () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const memoryDir = getMemoryDir(settings, workspace);
+    const legacyPath = path.join(memoryDir, "events", "legacy-overwrite.md");
+    fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
+    fs.writeFileSync(
+      legacyPath,
+      stringifyFrontmatter("# Legacy heading\n", {
+        id: "event.legacy-overwrite",
+        kind: "event",
+        description: "Legacy original",
+        created: "2026-01-01T00:00:00.000Z",
+        updated: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    const { pi, tools } = fakePi();
+    registerMemoryWrite(pi, settings);
+    const result = await tools.get("memory_write").execute(
+      "write-legacy",
+      {
+        path: "events/legacy-overwrite.md",
+        kind: "event",
+        description: "Legacy replacement",
+        content: "# Replacement heading\n",
+      },
+      new AbortController().signal,
+      () => {},
+      { cwd: workspace },
+    );
+
+    assert.equal(result.details.operation, "overwrite");
+    assert.match(
+      result.content[0].text,
+      /^Memory file overwritten: records\/event\.legacy-overwrite\.md \(@event\.legacy-overwrite\)/,
+    );
+    assert.match(result.content[0].text, /- # Legacy heading/);
+    assert.match(result.content[0].text, /\+ # Replacement heading/);
+    assert.equal(fs.existsSync(path.join(memoryDir, "records", "event.legacy-overwrite.md")), true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("frontmatter parser reads legacy folded descriptions and block tags", () => {
   const parsed = parseFrontmatter(`---

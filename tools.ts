@@ -76,6 +76,104 @@ function formatConceptDuplicateHints(hints?: ConceptDuplicateHint[]): string {
     ...hints.map((hint) => `- ${hint.concept} is similar to ${hint.candidate} (${hint.score})`),
   ].join("\n");
 }
+
+type MemoryOverwriteDiffSummary = {
+  oldStart: number;
+  newStart: number;
+  oldLines: string[];
+  newLines: string[];
+  additions: number;
+  removals: number;
+  lineRange: string;
+  text: string;
+};
+
+function splitMarkdownLines(text: string): string[] {
+  return text.split("\n");
+}
+
+function formatMemoryOverwriteLineRange(
+  diff: Pick<MemoryOverwriteDiffSummary, "oldStart" | "newStart" | "oldLines" | "newLines">,
+): string {
+  const oldEnd = diff.oldStart + Math.max(0, diff.oldLines.length - 1);
+  if (diff.oldLines.length <= 1 && diff.newLines.length <= 1) return `:${diff.oldStart}`;
+  const newEnd = diff.newStart + Math.max(0, diff.newLines.length - 1);
+  return `:${diff.oldStart}-${Math.max(oldEnd, newEnd)}`;
+}
+
+function formatMemoryOverwriteDiff(
+  diff: Pick<MemoryOverwriteDiffSummary, "lineRange" | "oldLines" | "newLines">,
+): string {
+  return [
+    "── diff ──",
+    diff.lineRange,
+    ...diff.oldLines.map((line) => `- ${line}`),
+    ...diff.newLines.map((line) => `+ ${line}`),
+  ].join("\n");
+}
+
+function buildMemoryOverwriteDiff(beforeRaw: string, afterRaw: string): MemoryOverwriteDiffSummary | undefined {
+  const before = splitMarkdownLines(beforeRaw);
+  const after = splitMarkdownLines(afterRaw);
+  let prefix = 0;
+  while (prefix < before.length && prefix < after.length && before[prefix] === after[prefix]) prefix++;
+
+  let suffix = 0;
+  while (
+    suffix < before.length - prefix &&
+    suffix < after.length - prefix &&
+    before[before.length - 1 - suffix] === after[after.length - 1 - suffix]
+  ) {
+    suffix++;
+  }
+
+  if (prefix === before.length && prefix === after.length) return undefined;
+
+  const diff = {
+    oldStart: prefix + 1,
+    newStart: prefix + 1,
+    oldLines: before.slice(prefix, before.length - suffix),
+    newLines: after.slice(prefix, after.length - suffix),
+  };
+  const lineRange = formatMemoryOverwriteLineRange(diff);
+  const summary = {
+    ...diff,
+    additions: diff.newLines.length,
+    removals: diff.oldLines.length,
+    lineRange,
+    text: "",
+  };
+  summary.text = formatMemoryOverwriteDiff(summary);
+  return summary;
+}
+
+function renderMemoryDiffLine(theme: Theme, line: string): string {
+  if (line === "── diff ──") return theme.fg("muted", "diff");
+  if (/^:\d+(?:-\d+)?$/.test(line)) return theme.fg("muted", line);
+  if (line.startsWith("+ ")) return theme.fg("success", line);
+  if (line.startsWith("- ")) return theme.fg("error", line);
+  return theme.fg("toolOutput", line);
+}
+
+function renderMemoryOutput(text: string, diff: MemoryOverwriteDiffSummary | undefined, theme: Theme): string {
+  if (!diff) return theme.fg("toolOutput", text);
+  let inDiff = false;
+  return text
+    .split("\n")
+    .map((line) => {
+      if (line === "── diff ──") {
+        inDiff = true;
+        return renderMemoryDiffLine(theme, line);
+      }
+      if (inDiff && line === "") {
+        inDiff = false;
+        return theme.fg("toolOutput", line);
+      }
+      return inDiff ? renderMemoryDiffLine(theme, line) : theme.fg("toolOutput", line);
+    })
+    .join("\n");
+}
+
 function buildExpandHint(totalLines: number, theme: Theme): string {
   const remaining = totalLines - 1;
   if (remaining <= 0) return "";
@@ -97,11 +195,11 @@ function renderMemoryResult(
   result: { content: Array<{ type: string; text?: string }>; details?: unknown },
   options: { expanded: boolean; isPartial: boolean },
   theme: Theme,
-  defaults?: { description?: string; tags?: string[]; notice?: string },
+  defaults?: { description?: string; tags?: string[]; notice?: string; diff?: MemoryOverwriteDiffSummary },
 ): Text {
   if (options.isPartial) return renderText(theme.fg("warning", "Reading..."));
   const details = result.details as
-    | { error?: boolean; frontmatter?: { description?: string; tags?: string[] } }
+    | { error?: boolean; frontmatter?: { description?: string; tags?: string[] }; diff?: MemoryOverwriteDiffSummary }
     | undefined;
   if (details?.error) return renderText(theme.fg("error", getResultText(result) || "Error"));
 
@@ -109,21 +207,26 @@ function renderMemoryResult(
   const tags = defaults?.tags || details?.frontmatter?.tags || [];
   const text = getResultText(result);
   const notice = defaults?.notice;
+  const diff = defaults?.diff ?? details?.diff;
+  const overwriteStats = diff
+    ? `${theme.fg("success", `+${diff.additions}`)}${theme.fg("muted", " / ")}${theme.fg("error", `-${diff.removals}`)}${theme.fg("muted", " overwrite")}`
+    : "";
 
   if (!options.expanded) {
     const summary = [
       theme.fg("success", description),
+      overwriteStats,
       theme.fg("muted", `Tags: ${tags.join(", ") || "none"}`),
       notice ? theme.fg("warning", notice) : "",
     ]
       .filter(Boolean)
       .join("\n");
-    return renderText(summary + buildExpandHint(text.split("\n").length + summary.split("\n").length, theme));
+    return renderText(summary + buildExpandHint(text.split("\n").length + 1, theme));
   }
 
   return renderText(
     theme.fg("success", description) +
-      `\n${theme.fg("muted", `Tags: ${tags.join(", ") || "none"}`)}${notice ? `\n${theme.fg("warning", notice)}` : ""}\n${theme.fg("toolOutput", text)}`,
+      `\n${theme.fg("muted", `Tags: ${tags.join(", ") || "none"}`)}${notice ? `\n${theme.fg("warning", notice)}` : ""}\n${renderMemoryOutput(text, diff, theme)}`,
   );
 }
 
@@ -437,7 +540,8 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
         if (!contentValidation.valid) throw new Error(contentValidation.error);
 
         const legacyPath = resolveMemoryPath(memoryDir, relPath);
-        const legacyExisting = fs.existsSync(legacyPath) ? readMemoryFile(legacyPath) : null;
+        const legacyExists = fs.existsSync(legacyPath);
+        const legacyExisting = legacyExists ? readMemoryFile(legacyPath) : null;
         const target = resolveMemoryWriteTarget(
           memoryDir,
           relPath,
@@ -445,7 +549,10 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
           legacyExisting?.frontmatter.id,
           legacyExisting?.frontmatter.kind,
         );
-        const existing = fs.existsSync(target.filePath) ? readMemoryFile(target.filePath) : legacyExisting;
+        const targetExists = fs.existsSync(target.filePath);
+        const existingPath = targetExists ? target.filePath : legacyExists && legacyExisting ? legacyPath : null;
+        const beforeRaw = existingPath ? fs.readFileSync(existingPath, "utf-8") : undefined;
+        const existing = targetExists ? readMemoryFile(target.filePath) : legacyExisting;
 
         const today = getCurrentDate();
         const frontmatter: MemoryFrontmatter = {
@@ -462,18 +569,27 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
         delete frontmatter.kind;
 
         writeMemoryFile(target.filePath, memoryContent, frontmatter);
+        const afterRaw = fs.readFileSync(target.filePath, "utf-8");
+        const overwriteDiff = beforeRaw === undefined ? undefined : buildMemoryOverwriteDiff(beforeRaw, afterRaw);
         upsertMemoryCatalog(memoryDir, target.filePath);
         const relTarget = path.relative(memoryDir, target.filePath);
         const duplicateHints = formatConceptDuplicateHints(conceptNormalization.audit.possibleDuplicates);
+        const operation = beforeRaw === undefined ? "create" : "overwrite";
+        const status =
+          operation === "overwrite"
+            ? `Memory file overwritten: ${relTarget} (@${target.id})`
+            : `Memory file written: ${relTarget} (@${target.id})`;
         return {
           content: [
             {
               type: "text",
-              text: [`Memory file written: ${relTarget} (@${target.id})`, duplicateHints].filter(Boolean).join("\n\n"),
+              text: [status, overwriteDiff?.text, duplicateHints].filter(Boolean).join("\n\n"),
             },
           ],
           details: {
             path: target.filePath,
+            operation,
+            diff: overwriteDiff,
             frontmatter: { ...frontmatter, id: target.id, kind: target.kind },
             concepts: conceptNormalization.audit,
           },
@@ -491,11 +607,13 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
       const details = result.details as {
         frontmatter?: { description?: string; tags?: string[] };
         concepts?: { possibleDuplicates?: ConceptDuplicateHint[] };
+        diff?: MemoryOverwriteDiffSummary;
       };
       return renderMemoryResult(result, options, theme, {
         description: details?.frontmatter?.description,
         tags: details?.frontmatter?.tags,
         notice: formatConceptDuplicateHints(details?.concepts?.possibleDuplicates),
+        diff: details?.diff,
       });
     },
   });
