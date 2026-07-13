@@ -78,7 +78,7 @@ relation.evidence -> @event.runtime-investigation
 <!-- /memory:facts -->
 ```
 
-IDs can be used as `@event.runtime-investigation`. Legacy `state/` and `events/` files may still be read during compatibility, but new writes use `records/`.
+IDs can be used as `@event.runtime-investigation`. Legacy `state/` and `events/` files may still be read during compatibility, but new writes use `records/`. When `memory_write` replaces an existing logical record, the response says it was overwritten and includes a compact line diff; new creates keep the plain written response.
 
 ## Structured-first records
 
