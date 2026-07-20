@@ -7,6 +7,20 @@ description: Read and write project-scoped state, reports, and research with pi-
 
 Use Memory as an auxiliary, project-scoped channel. It does not manage tasks and does not depend on Harness or another workflow system.
 
+## Daily loop
+
+> Search first, read compact knowledge, then write only durable findings.
+
+```text
+START: memory_search({ query: "task keywords", searchIn: "all" })
+READ:  memory_read({ path: "@event.or-state-id", view: "knowledge" })
+END:   memory_write({ path: "events/<topic>.md", kind: "event", summary, claims or facts })
+```
+
+Default to `event` for reports, progress, audits, releases, and investigations. Use `state` only to update knowledge that is still true tomorrow, such as preferences, active architecture, access shape, or runtime conventions. If unsure, write an `event`.
+
+> Do not dump the whole session into Memory.
+
 ## Layout
 
 ```text
@@ -42,7 +56,7 @@ Prefer one topic or result per file.
 
 ## Writing
 
-Use `memory_write` for both create and full replacement. Prefer structured semantic fields over long prose: `summary`, `concepts`, `claims`, `facts`, `relations`, and optional `notes`. For ergonomics, pass logical paths under `state/` or `events/`; new writes are stored as identity-addressed `records/<stable-id>.md` files.
+Use `memory_write` for both create and full replacement. Prefer structured semantic fields over long prose: `summary`, `concepts`, `claims`, `facts`, `relations`, and optional `notes`. For ergonomics, pass logical paths under `state/` or `events/`; new writes are stored as identity-addressed `records/<stable-id>.md` files. Use `sensitive: true` for records that should never be injected automatically.
 
 ```text
 memory_write({

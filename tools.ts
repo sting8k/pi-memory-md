@@ -77,6 +77,49 @@ function formatConceptDuplicateHints(hints?: ConceptDuplicateHint[]): string {
   ].join("\n");
 }
 
+const SENSITIVE_MEMORY_PATTERN =
+  /\b(?:api[-_\s]?key|credential|identity[-_\s]?file|password|passwd|private[-_\s]?key|secret|ssh|token)\b/i;
+
+function hasSensitiveMemoryInput(value: unknown): boolean {
+  if (typeof value === "string") return SENSITIVE_MEMORY_PATTERN.test(value);
+  if (Array.isArray(value)) return value.some((entry) => hasSensitiveMemoryInput(entry));
+  if (typeof value === "object" && value !== null) {
+    return Object.entries(value).some(
+      ([key, entry]) => SENSITIVE_MEMORY_PATTERN.test(key) || hasSensitiveMemoryInput(entry),
+    );
+  }
+  return false;
+}
+
+function formatMemoryWriteWarnings(warnings: string[]): string {
+  if (warnings.length === 0) return "";
+  return ["Memory write warnings:", ...warnings.map((warning) => `- ${warning}`)].join("\n");
+}
+
+function buildMemoryWriteWarnings(input: {
+  summary?: string;
+  claims?: string[];
+  facts?: Record<string, unknown>;
+  content?: string;
+  finalSensitive: boolean;
+  detectedSensitive: boolean;
+}): string[] {
+  const warnings: string[] = [];
+  if (!input.summary?.trim()) warnings.push("Add a one-sentence summary so future searches do not need full prose.");
+  if (!input.claims?.length && Object.keys(input.facts ?? {}).length === 0) {
+    warnings.push("Add at least one claim or fact for durable retrieval.");
+  }
+  if (input.content && input.content.length > 800) {
+    warnings.push("Raw content is long; prefer structured fields plus short notes.");
+  }
+  if (input.detectedSensitive) {
+    warnings.push("Sensitive-looking content was marked sensitive and will not be injected automatically.");
+  } else if (input.finalSensitive) {
+    warnings.push("Sensitive record will not be injected automatically.");
+  }
+  return warnings;
+}
+
 type MemoryOverwriteDiffSummary = {
   oldStart: number;
   newStart: number;
@@ -480,6 +523,7 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
       relations: Type.Optional(Type.Record(Type.String(), Type.String({ description: "Relation target stable @id" }))),
       notes: Type.Optional(Type.String({ description: "Optional prose/evidence rendered after structured knowledge" })),
       tags: Type.Optional(Type.Array(Type.String())),
+      sensitive: Type.Optional(Type.Boolean({ description: "Mark this record as non-injectable sensitive memory" })),
       kind: Type.Optional(
         Type.Union([Type.Literal("state"), Type.Literal("event")], {
           description: "Optional lifecycle; inferred from logical path or record ID and must match it",
@@ -499,12 +543,14 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
         relations,
         notes,
         tags,
+        sensitive,
         kind: requestedKind,
       } = params as {
         path: string;
         content?: string;
         description: string;
         tags?: string[];
+        sensitive?: boolean;
         kind?: "state" | "event";
       } & StructuredMemoryFields;
       const memoryDir = getMemoryDir(settings, ctx.cwd);
@@ -536,6 +582,18 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
             notes,
           });
 
+        const detectedSensitive = hasSensitiveMemoryInput({
+          content: memoryContent,
+          concepts: normalizedConcepts,
+          description,
+          facts,
+          relations,
+          summary,
+          claims,
+          notes,
+          tags,
+        });
+
         const contentValidation = validateMemoryContent(memoryContent);
         if (!contentValidation.valid) throw new Error(contentValidation.error);
 
@@ -554,6 +612,9 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
         const beforeRaw = existingPath ? fs.readFileSync(existingPath, "utf-8") : undefined;
         const existing = targetExists ? readMemoryFile(target.filePath) : legacyExisting;
 
+        const detectedOrRequestedSensitive = detectedSensitive || sensitive === true;
+        const finalSensitive =
+          detectedOrRequestedSensitive || (sensitive === undefined && existing?.frontmatter.sensitive === true);
         const today = getCurrentDate();
         const frontmatter: MemoryFrontmatter = {
           ...existing?.frontmatter,
@@ -565,6 +626,8 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
           updated: today,
           ...(tags && { tags }),
         };
+        if (finalSensitive) frontmatter.sensitive = true;
+        else delete frontmatter.sensitive;
         delete frontmatter.id;
         delete frontmatter.kind;
 
@@ -574,6 +637,16 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
         upsertMemoryCatalog(memoryDir, target.filePath);
         const relTarget = path.relative(memoryDir, target.filePath);
         const duplicateHints = formatConceptDuplicateHints(conceptNormalization.audit.possibleDuplicates);
+        const writeWarnings = formatMemoryWriteWarnings(
+          buildMemoryWriteWarnings({
+            summary,
+            claims,
+            facts,
+            content,
+            finalSensitive,
+            detectedSensitive,
+          }),
+        );
         const operation = beforeRaw === undefined ? "create" : "overwrite";
         const status =
           operation === "overwrite"
@@ -583,7 +656,7 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
           content: [
             {
               type: "text",
-              text: [status, overwriteDiff?.text, duplicateHints].filter(Boolean).join("\n\n"),
+              text: [status, overwriteDiff?.text, duplicateHints, writeWarnings].filter(Boolean).join("\n\n"),
             },
           ],
           details: {
@@ -592,6 +665,14 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
             diff: overwriteDiff,
             frontmatter: { ...frontmatter, id: target.id, kind: target.kind },
             concepts: conceptNormalization.audit,
+            warnings: buildMemoryWriteWarnings({
+              summary,
+              claims,
+              facts,
+              content,
+              finalSensitive,
+              detectedSensitive,
+            }),
           },
         };
       } catch (error) {
@@ -769,12 +850,20 @@ export function registerMemorySearch(pi: ExtensionAPI, settings: MemoryMdSetting
       const normalizedQuery = searchIn === "concepts" ? normalizeConceptSearchQuery(memoryDir, query) : query;
       const hits = searchMemoryFiles({ files: fileMap, query: normalizedQuery, searchIn, kind });
 
-      const results = hits.map((h) => ({
-        path: h.path,
-        match: h.snippet,
-        matchCount: h.matchCount,
-        matchedIn: h.matchedIn,
-      }));
+      const catalogByPath = new Map(getMemoryCatalog(memoryDir).map((entry) => [entry.path, entry]));
+      const results = hits.map((h) => {
+        const entry = catalogByPath.get(h.path);
+        const id = entry?.id ?? h.path;
+        return {
+          path: h.path,
+          id,
+          kind: entry?.kind,
+          match: h.snippet,
+          matchCount: h.matchCount,
+          matchedIn: h.matchedIn,
+          next: `memory_read({ path: "@${id}", view: "knowledge" })`,
+        };
+      });
 
       return {
         content: [
@@ -783,7 +872,9 @@ export function registerMemorySearch(pi: ExtensionAPI, settings: MemoryMdSetting
             text:
               results.length === 0
                 ? "No results found."
-                : `Found ${results.length} result(s):\n\n${results.map((r) => `  ${r.path}\n  ${r.match}`).join("\n\n")}`,
+                : `Found ${results.length} result(s):\n\n${results
+                    .map((r) => `  ${r.path} (@${r.id})\n  ${r.match}\n  Next: ${r.next}`)
+                    .join("\n\n")}`,
           },
         ],
         details: { results, count: results.length, query: normalizedQuery },

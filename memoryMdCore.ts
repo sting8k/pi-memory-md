@@ -616,7 +616,7 @@ export const MEMORY_FACTS_END = "<!-- /memory:facts -->";
 const MEMORY_KEY_PATTERN = /^[a-z][a-z0-9_.-]*$/;
 const MEMORY_RECORDS_DIR = "records";
 const MEMORY_CATALOG_FILE = ".catalog.json";
-const MEMORY_CATALOG_VERSION = 3;
+const MEMORY_CATALOG_VERSION = 4;
 const CONCEPT_DICTIONARY_FILE = ".concepts.json";
 
 export interface MemoryCatalogEntry {
@@ -627,6 +627,7 @@ export interface MemoryCatalogEntry {
   summary?: string;
   concepts: string[];
   claims: string[];
+  sensitive?: boolean;
   tags: string[];
   created?: string;
   updated?: string;
@@ -1117,6 +1118,10 @@ function validateFrontmatter(data: ParsedFrontmatter): { valid: boolean; error?:
     return { valid: false, error: "'summary' must be a string if provided" };
   }
 
+  if (frontmatter.sensitive !== undefined && typeof frontmatter.sensitive !== "boolean") {
+    return { valid: false, error: "'sensitive' must be a boolean if provided" };
+  }
+
   if (frontmatter.limit !== undefined && (typeof frontmatter.limit !== "number" || frontmatter.limit <= 0)) {
     return { valid: false, error: "'limit' must be a positive number" };
   }
@@ -1333,6 +1338,7 @@ function catalogEntryFromMemory(memoryDir: string, filePath: string): MemoryCata
     summary: memory.frontmatter.summary,
     concepts: memory.frontmatter.concepts ?? [],
     claims: memory.frontmatter.claims ?? [],
+    sensitive: memory.frontmatter.sensitive || undefined,
     tags: memory.frontmatter.tags ?? [],
     created: memory.frontmatter.created,
     updated: memory.frontmatter.updated,
@@ -1517,6 +1523,7 @@ export function buildMemoryContext(settings: MemoryMdSettings, cwd: string): str
   if (!fs.existsSync(memoryDir)) return "";
 
   const memories = getMemoryCatalog(memoryDir)
+    .filter((entry) => !entry.sensitive)
     .sort(
       (a, b) =>
         memoryTimestamp(path.join(memoryDir, b.path), b) - memoryTimestamp(path.join(memoryDir, a.path), a) ||

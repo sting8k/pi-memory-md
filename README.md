@@ -39,7 +39,7 @@ Each Git workspace gets an isolated project directory derived from its Git root 
 - New writes are identity-addressed records. For ergonomic calls, `memory_write(path="events/foo.md", kind="event", ...)` writes `records/event.foo.md`.
 - `.catalog.json` is a rebuildable slim metadata catalog used for fast `@id` lookup, listing, latest-memory context, and metadata search. It does not store full Markdown content.
 - `.concepts.json` is a small project dictionary for canonical concept labels and aliases; writes update it transparently.
-- The extension injects metadata for only the 10 most recently updated catalog entries.
+- The extension injects metadata for only the 10 most recently updated non-sensitive catalog entries.
 - Full Markdown content is loaded on demand with `memory_read(view="full")`; compact semantic projections use `view="summary"` or `view="knowledge"`.
 
 ## Tools
@@ -52,9 +52,7 @@ Each Git workspace gets an isolated project directory derived from its Git root 
 | `memory_search` | Search content or metadata, optionally by kind |
 | `memory_delete` | Explicitly delete one memory record and reconcile derived metadata |
 | `memory_init` | Initialize identity-addressed `records/` |
-| `memory_sync` | Pull, push, or inspect the backing repository |
 | `memory_migrate` | Rename a project or migrate a legacy project layout |
-| `memory_check` | Check project memory structure |
 
 
 ## Frontmatter
@@ -93,6 +91,8 @@ Prefer structured semantic fields over long prose. `memory_write` can generate c
 - `notes`: optional evidence/prose loaded only in full view.
 
 Generated structured Markdown keeps `summary`, `concepts`, and `claims` in frontmatter/read projections instead of repeating them in the body. A memory may still include one machine-checkable fact block. Markdown outside it stays unrestricted for compatibility.
+
+`memory_write` accepts `sensitive: true` for records that must not be injected automatically. The tool may also mark sensitive-looking writes, such as SSH keys, tokens, credential paths, or passwords, as non-injectable and return a warning instead of rejecting the write.
 
 ```markdown
 <!-- memory:facts:v1 -->

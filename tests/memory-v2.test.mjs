@@ -65,7 +65,7 @@ function renderToolText(component) {
   return component.render(500).join("\n");
 }
 
-test("memory_write create keeps plain success without diff", async () => {
+test("memory_write create returns success with soft quality warnings", async () => {
   const { root, workspace, settings } = fixture();
   try {
     const { pi, tools } = fakePi();
@@ -89,9 +89,44 @@ test("memory_write create keeps plain success without diff", async () => {
     assert.equal(result.details.diff, undefined);
     assert.match(
       result.content[0].text,
-      /^Memory file written: records\/event\.create-diff\.md \(@event\.create-diff\)$/,
+      /^Memory file written: records\/event\.create-diff\.md \(@event\.create-diff\)/,
     );
+    assert.match(result.content[0].text, /Memory write warnings:/);
+    assert.match(result.content[0].text, /Add a one-sentence summary/);
+    assert.deepEqual(result.details.warnings, [
+      "Add a one-sentence summary so future searches do not need full prose.",
+      "Add at least one claim or fact for durable retrieval.",
+    ]);
     assert.doesNotMatch(result.content[0].text, /overwritten|── diff ──/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("memory_write marks sensitive-looking records as non-injectable", async () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const { pi, tools } = fakePi();
+    registerMemoryWrite(pi, settings);
+    const result = await tools.get("memory_write").execute(
+      "write-sensitive",
+      {
+        path: "events/ops-access.md",
+        kind: "event",
+        description: "Ops access token path",
+        summary: "Ops access details include credential paths",
+        claims: ["Sensitive records should not be injected automatically"],
+        facts: { "ssh.identity_file": "/tmp/key" },
+      },
+      new AbortController().signal,
+      () => {},
+      { cwd: workspace },
+    );
+
+    assert.equal(result.details.frontmatter.sensitive, true);
+    assert.match(result.content[0].text, /Sensitive-looking content was marked sensitive/);
+    const context = buildMemoryContext(settings, workspace);
+    assert.doesNotMatch(context, /Ops access token path/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -132,7 +167,7 @@ test("memory_write overwrite diff preserves a terminal-newline change", async ()
 
     assert.equal(result.details.operation, "overwrite");
     assert.equal(result.details.diff.newLines.at(-1), "");
-    assert.equal(result.content[0].text.endsWith("\n+ "), true);
+    assert.match(result.content[0].text, /\n\+ /);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -671,6 +706,35 @@ test("structured memory records support compact semantic read and search", () =>
   }
 });
 
+test("memory_search returns stable IDs and knowledge-read next steps", async () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const memoryDir = getMemoryDir(settings, workspace);
+    const target = resolveMemoryWriteTarget(memoryDir, "events/search-next.md", "event");
+    writeMemoryFile(target.filePath, "# Search next\n", {
+      description: "Search next step",
+      summary: "Search results guide agents to compact knowledge reads",
+      claims: ["Search output should include the stable ID and next read call"],
+    });
+    upsertMemoryCatalog(memoryDir, target.filePath);
+
+    const { pi, tools } = fakePi();
+    registerMemorySearch(pi, settings);
+    const result = await tools
+      .get("memory_search")
+      .execute("search-next", { query: "compact knowledge", searchIn: "all" }, new AbortController().signal, () => {}, {
+        cwd: workspace,
+      });
+
+    assert.equal(result.details.results[0].id, "event.search-next");
+    assert.equal(result.details.results[0].next, 'memory_read({ path: "@event.search-next", view: "knowledge" })');
+    assert.match(result.content[0].text, /records\/event\.search-next\.md \(@event\.search-next\)/);
+    assert.match(result.content[0].text, /Next: memory_read\(\{ path: "@event\.search-next", view: "knowledge" \}\)/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("search treats metric queries literally while preserving explicit regex", () => {
   const files = new Map([
     [
@@ -737,12 +801,94 @@ test("context injects only the ten most recently updated memories", () => {
       });
     }
 
+    const secretPath = path.join(memoryDir, "events", "secret.md");
+    writeMemoryFile(secretPath, "# Secret", {
+      id: "event.secret",
+      kind: "event",
+      description: "Secret token path",
+      sensitive: true,
+      created: "2026-07-20",
+      updated: "2026-07-20",
+    });
     const context = buildMemoryContext(settings, workspace);
     assert.equal(context.split("\n").filter((line) => line.startsWith("- ")).length, 10);
     assert.match(context, /Memory 12/);
+    assert.doesNotMatch(context, /Secret token path/);
     assert.match(context, /Memory 3/);
     assert.doesNotMatch(context, /Memory 2(?:\D|$)/);
     assert.doesNotMatch(context, /Memory 1(?:\D|$)/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("context rebuilds old catalogs before filtering sensitive memories", () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const memoryDir = getMemoryDir(settings, workspace);
+    const publicPath = path.join(memoryDir, "events", "public.md");
+    const secretPath = path.join(memoryDir, "events", "secret.md");
+    writeMemoryFile(publicPath, "# Public", {
+      id: "event.public",
+      kind: "event",
+      description: "Public context",
+      created: "2026-07-10",
+      updated: "2026-07-10",
+    });
+    writeMemoryFile(secretPath, "# Secret", {
+      id: "event.secret",
+      kind: "event",
+      description: "Secret token path",
+      sensitive: true,
+      created: "2026-07-20",
+      updated: "2026-07-20",
+    });
+
+    const publicStats = fs.statSync(publicPath);
+    const secretStats = fs.statSync(secretPath);
+    fs.writeFileSync(
+      path.join(memoryDir, ".catalog.json"),
+      `${JSON.stringify(
+        {
+          version: 3,
+          entries: [
+            {
+              path: path.relative(memoryDir, publicPath),
+              id: "event.public",
+              kind: "event",
+              description: "Public context",
+              concepts: [],
+              claims: [],
+              tags: [],
+              created: "2026-07-10",
+              updated: "2026-07-10",
+              mtimeMs: publicStats.mtimeMs,
+              size: publicStats.size,
+            },
+            {
+              path: path.relative(memoryDir, secretPath),
+              id: "event.secret",
+              kind: "event",
+              description: "Secret token path",
+              concepts: [],
+              claims: [],
+              tags: [],
+              created: "2026-07-20",
+              updated: "2026-07-20",
+              mtimeMs: secretStats.mtimeMs,
+              size: secretStats.size,
+            },
+          ],
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+    const context = buildMemoryContext(settings, workspace);
+    assert.match(context, /Public context/);
+    assert.doesNotMatch(context, /Secret token path/);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(memoryDir, ".catalog.json"), "utf-8")).version, 4);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

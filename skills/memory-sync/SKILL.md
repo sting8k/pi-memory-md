@@ -1,74 +1,18 @@
 ---
 name: memory-sync
-description: Git synchronization operations for pi-memory-md repository
+description: Admin-only synchronization notes for pi-memory-md.
 ---
 
 # Memory Sync
 
-Git synchronization for pi-memory-md repository.
+This skill is not loaded by default. Agents should not call `memory_sync` or `memory_check`; those tools are intentionally not exposed in normal runtime.
 
-## Configuration
+## Operator notes
 
-Configure `pi-memory-md.repoUrl` in settings file (global: `~/.pi/agent/settings.json`, project: `.pi/settings.json`)
+- Memory sync is handled by extension settings and repo operations, not the daily agent loop.
+- Use Memory tools for agent work: `memory_search`, `memory_read`, `memory_write`, and `memory_list`.
+- If repository maintenance is needed, the operator should use the available slash commands or regular git commands outside the agent tool loop.
 
-## Sync Operations
+## Agent rule
 
-### Pull
-
-Fetch latest changes from GitHub:
-
-```
-memory_sync(action="pull")
-```
-
-Use before starting work or switching machines.
-
-### Push
-
-Upload local changes to GitHub:
-
-```
-memory_sync(action="push")
-```
-
-Auto-commits changes before pushing.
-
-**Before pushing, ALWAYS run memory_check first:**
-
-```
-memory_check()
-```
-
-This verifies that the current Git project resolves to a valid `projects/<project-slug>/records` layout with a rebuildable catalog.
-
-### Status
-
-Check uncommitted changes:
-
-```
-memory_sync(action="status")
-```
-
-Shows modified/added/deleted files.
-
-## Typical Workflow
-
-| Action | Command |
-|--------|---------|
-| Get updates | `memory_sync(action="pull")` |
-| Check changes | `memory_sync(action="status")` |
-| Upload changes | `memory_sync(action="push")` |
-
-## Troubleshooting
-
-| Error | Solution |
-|--------|----------|
-| Non-fast-forward | Pull first, then push |
-| Conflicts | Manual resolution via bash git commands |
-| Not a git repo | Run `memory_init(force=true)` |
-| Permission denied | Check SSH keys or repo URL |
-
-## Related Skills
-
-- `memory-management` - Read and write files
-- `memory-init` - Setup repository
+Do not suggest or call the sync/check tool names in normal work.

@@ -38,7 +38,6 @@ memory_init({ force: true })
 After initialization:
 
 ```text
-memory_check({})
 memory_list({})
 ```
 
@@ -71,4 +70,4 @@ Legacy migration is compatibility-only for old data and may create readable lega
 
 1. Update `@state.identity` and `@state.preferences` only if they contain durable current information.
 2. Store reports and research through logical `events/*.md` paths; they will be written under `records/event.*.md`.
-3. Use `memory_read` or `memory_search` to load full content on demand.
+3. Use `memory_read({ path: "@state.identity", view: "knowledge" })` or `memory_search({ query: "identity preferences", searchIn: "all" })` to load compact context on demand.

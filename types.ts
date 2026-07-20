@@ -45,6 +45,7 @@ export interface MemoryFrontmatter {
   summary?: string;
   concepts?: string[];
   claims?: string[];
+  sensitive?: boolean;
   limit?: number;
   tags?: string[];
   created?: string;
