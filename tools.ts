@@ -5,10 +5,12 @@ import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import {
+  addConceptAlias,
   buildStructuredMemoryContent,
   createDefaultFiles,
   deleteMemoryFile,
   ensureDirectoryStructure,
+  expandConceptSearchFamilies,
   formatMemoryRead,
   getCurrentDate,
   getMemoryCatalog,
@@ -78,7 +80,7 @@ function formatConceptDuplicateHints(hints?: ConceptDuplicateHint[]): string {
 }
 
 const SENSITIVE_MEMORY_PATTERN =
-  /\b(?:api[-_\s]?key|credential|identity[-_\s]?file|password|passwd|private[-_\s]?key|secret|ssh|token)\b/i;
+  /\b(?:api[-_\s]?key|credential|identity[-_\s]?file|password|passwd|private[-_\s]?key|secret|ssh|(?:api|access|auth|bearer|refresh|session|oauth)[-_\s]?token|token\s*[=:]\s*\S+)\b/i;
 
 function hasSensitiveMemoryInput(value: unknown): boolean {
   if (typeof value === "string") return SENSITIVE_MEMORY_PATTERN.test(value);
@@ -103,8 +105,10 @@ function buildMemoryWriteWarnings(input: {
   content?: string;
   finalSensitive: boolean;
   detectedSensitive: boolean;
+  hygieneWarnings?: string[];
 }): string[] {
   const warnings: string[] = [];
+  if (input.hygieneWarnings?.length) warnings.push(...input.hygieneWarnings);
   if (!input.summary?.trim()) warnings.push("Add a one-sentence summary so future searches do not need full prose.");
   if (!input.claims?.length && Object.keys(input.facts ?? {}).length === 0) {
     warnings.push("Add at least one claim or fact for durable retrieval.");
@@ -612,9 +616,7 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
         const beforeRaw = existingPath ? fs.readFileSync(existingPath, "utf-8") : undefined;
         const existing = targetExists ? readMemoryFile(target.filePath) : legacyExisting;
 
-        const detectedOrRequestedSensitive = detectedSensitive || sensitive === true;
-        const finalSensitive =
-          detectedOrRequestedSensitive || (sensitive === undefined && existing?.frontmatter.sensitive === true);
+        const finalSensitive = sensitive === undefined ? detectedSensitive : sensitive;
         const today = getCurrentDate();
         const frontmatter: MemoryFrontmatter = {
           ...existing?.frontmatter,
@@ -645,6 +647,7 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
             content,
             finalSensitive,
             detectedSensitive,
+            hygieneWarnings: conceptNormalization.audit.warnings,
           }),
         );
         const operation = beforeRaw === undefined ? "create" : "overwrite";
@@ -672,6 +675,7 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
               content,
               finalSensitive,
               detectedSensitive,
+              hygieneWarnings: conceptNormalization.audit.warnings,
             }),
           },
         };
@@ -848,7 +852,11 @@ export function registerMemorySearch(pi: ExtensionAPI, settings: MemoryMdSetting
       }
 
       const normalizedQuery = searchIn === "concepts" ? normalizeConceptSearchQuery(memoryDir, query) : query;
-      const hits = searchMemoryFiles({ files: fileMap, query: normalizedQuery, searchIn, kind });
+      const conceptAliasFamilies =
+        searchIn === "concepts" && normalizedQuery.trim()
+          ? expandConceptSearchFamilies(memoryDir, normalizedQuery.split(/\s+/))
+          : undefined;
+      const hits = searchMemoryFiles({ files: fileMap, query: normalizedQuery, searchIn, kind, conceptAliasFamilies });
 
       const catalogByPath = new Map(getMemoryCatalog(memoryDir).map((entry) => [entry.path, entry]));
       const results = hits.map((h) => {
@@ -883,6 +891,40 @@ export function registerMemorySearch(pi: ExtensionAPI, settings: MemoryMdSetting
 
     renderCall: (args, theme) => new Text(buildToolCallText("memory_search", args, theme), 0, 0),
     renderResult: (result, options, theme) => renderCountResult(result, options, theme, "result(s)"),
+  });
+}
+
+export function registerMemoryAlias(pi: ExtensionAPI, settings: MemoryMdSettings): void {
+  pi.registerTool({
+    name: "memory_alias",
+    label: "Memory Alias",
+    description:
+      "Add an alias for an existing canonical concept so future memory_write and memory_search calls resolve it. " +
+      "Canonical must already exist in the concept dictionary; an alias that is currently a standalone concept is " +
+      "converted into an alias without rewriting existing records.",
+    parameters: Type.Object({
+      alias: Type.String({ description: "Alias label to resolve to the canonical concept" }),
+      canonical: Type.String({ description: "Existing canonical concept the alias should point to" }),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const { alias, canonical } = params as { alias: string; canonical: string };
+      const memoryDir = getMemoryDir(settings, ctx.cwd);
+      const result = addConceptAlias(memoryDir, alias, canonical);
+      const text = result.ok
+        ? result.converted
+          ? `Concept alias added: ${result.alias} -> ${result.canonical} (converted from standalone concept; existing records resolve lazily).`
+          : `Concept alias added: ${result.alias} -> ${result.canonical}.`
+        : `Failed to add concept alias: ${result.error}`;
+      return { content: [{ type: "text", text }], details: result };
+    },
+
+    renderCall: (args, theme) => new Text(buildToolCallText("memory_alias", args, theme), 0, 0),
+    renderResult: (result, options, theme) => {
+      if (options.isPartial) return renderText(theme.fg("warning", "Adding alias..."));
+      const details = result.details as { ok?: boolean };
+      return renderCollapsed(details?.ok ? "Alias added" : "Alias failed", getResultText(result), options, theme);
+    },
   });
 }
 
@@ -1041,6 +1083,7 @@ export function registerAllMemoryTools(
   registerMemoryWrite(pi, settings);
   registerMemoryList(pi, settings);
   registerMemorySearch(pi, settings);
+  registerMemoryAlias(pi, settings);
   registerMemoryDelete(pi, settings);
   registerMemoryInit(pi, settings, isRepoInitialized);
   registerMemoryMigrate(pi, settings);

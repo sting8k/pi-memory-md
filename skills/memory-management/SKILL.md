@@ -96,7 +96,7 @@ Views:
 - `knowledge`: summary, concepts, claims, facts, relations;
 - `full`: full Markdown including optional notes/prose.
 
-Use `memory_list` for metadata and `memory_search` for on-demand retrieval. Session injection contains metadata for only the 10 most recently updated memories, not full content.
+Use `memory_list` for metadata and `memory_search` for on-demand retrieval. Session injection contains metadata for up to 10 non-sensitive memories: the 5 newest `state` records plus the 5 newest `event` records, with two-way backfill when either kind has fewer.
 
 ## Frontmatter
 

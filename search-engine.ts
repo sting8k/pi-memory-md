@@ -259,6 +259,8 @@ export interface SearchInput {
   query: string;
   searchIn: SearchField;
   kind?: "state" | "event";
+  /** Optional OR-groups for exact concept matching: a record matches when it stores any term of each family. */
+  conceptAliasFamilies?: string[][];
 }
 
 export function searchMemoryFiles(input: SearchInput): SearchHit[] {
@@ -295,9 +297,13 @@ export function searchMemoryFiles(input: SearchInput): SearchHit[] {
     exactConceptTerms.length === rawQuery.split(/\s+/).length
   ) {
     const hits: SearchHit[] = [];
+    const families = input.conceptAliasFamilies;
+    const matchesExact = families
+      ? (concepts: string[]) => families.every((family) => family.some((term) => concepts.includes(term)))
+      : (concepts: string[]) => exactConceptTerms.every((term) => concepts.includes(term));
     for (const [relPath, memory] of entries) {
       const concepts = memory.frontmatter.concepts ?? [];
-      if (!exactConceptTerms.every((term) => concepts.includes(term))) continue;
+      if (!matchesExact(concepts)) continue;
       hits.push({
         path: relPath,
         snippet: buildSnippet(memory, searchIn, snippetRegex(exactConceptTerms)),

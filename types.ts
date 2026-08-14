@@ -36,6 +36,15 @@ export interface ConceptNormalizationAudit {
   resolvedAliases: Record<string, string>;
   registered: string[];
   possibleDuplicates: ConceptDuplicateHint[];
+  warnings: string[];
+}
+
+export interface ConceptAliasResult {
+  ok: boolean;
+  error?: string;
+  alias?: string;
+  canonical?: string;
+  converted?: boolean;
 }
 
 export interface MemoryFrontmatter {

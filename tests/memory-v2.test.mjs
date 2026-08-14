@@ -6,6 +6,7 @@ import test from "node:test";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { parseFrontmatter, stringifyFrontmatter } from "../.test-dist/frontmatter.js";
 import {
+  addConceptAlias,
   buildMemoryContext,
   buildStructuredMemoryContent,
   createMemoryId,
@@ -32,7 +33,12 @@ import {
   writeMemoryFile,
 } from "../.test-dist/memoryMdCore.js";
 import { searchMemoryFiles } from "../.test-dist/search-engine.js";
-import { registerMemoryDelete, registerMemorySearch, registerMemoryWrite } from "../.test-dist/tools.js";
+import {
+  registerMemoryAlias,
+  registerMemoryDelete,
+  registerMemorySearch,
+  registerMemoryWrite,
+} from "../.test-dist/tools.js";
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-v2-"));
@@ -889,6 +895,478 @@ test("context rebuilds old catalogs before filtering sensitive memories", () => 
     assert.match(context, /Public context/);
     assert.doesNotMatch(context, /Secret token path/);
     assert.equal(JSON.parse(fs.readFileSync(path.join(memoryDir, ".catalog.json"), "utf-8")).version, 4);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ============================================================================
+// Kind-aware injection quota (5 state + 5 event, two-way backfill)
+// ============================================================================
+
+function injectedRecordIds(context) {
+  return [...context.matchAll(/\(@([^)]+)\)/g)].map((match) => match[1]);
+}
+
+function writeDatedMemory(memoryDir, kind, id, day, datePrefix) {
+  const filePath = path.join(memoryDir, kind === "state" ? "state" : "events", `${id}.md`);
+  const date = `${datePrefix}-${String(day).padStart(2, "0")}`;
+  writeMemoryFile(filePath, `# ${id}`, {
+    id: `${kind}.${id}`,
+    kind,
+    description: `${kind} ${id}`,
+    created: date,
+    updated: date,
+  });
+}
+
+test("context injects newest state and event records within a 5/5 quota", () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const memoryDir = getMemoryDir(settings, workspace);
+    for (let day = 1; day <= 10; day++) {
+      writeDatedMemory(memoryDir, day % 2 === 0 ? "state" : "event", `memory-${day}`, day, "2026-08");
+    }
+    const context = buildMemoryContext(settings, workspace);
+    const ids = injectedRecordIds(context);
+    const states = ids.filter((id) => id.startsWith("state."));
+    const events = ids.filter((id) => id.startsWith("event."));
+    assert.equal(ids.length, 10);
+    assert.equal(states.length, 5);
+    assert.equal(events.length, 5);
+    assert.deepEqual(states, [
+      "state.memory-10",
+      "state.memory-8",
+      "state.memory-6",
+      "state.memory-4",
+      "state.memory-2",
+    ]);
+    assert.deepEqual(events, [
+      "event.memory-9",
+      "event.memory-7",
+      "event.memory-5",
+      "event.memory-3",
+      "event.memory-1",
+    ]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("context backfills missing state quota with newest events", () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const memoryDir = getMemoryDir(settings, workspace);
+    for (let day = 1; day <= 3; day++) writeDatedMemory(memoryDir, "state", `memory-${day}`, day, "2026-09");
+    for (let day = 4; day <= 15; day++) writeDatedMemory(memoryDir, "event", `memory-${day}`, day, "2026-09");
+    const context = buildMemoryContext(settings, workspace);
+    const ids = injectedRecordIds(context);
+    const states = ids.filter((id) => id.startsWith("state."));
+    const events = ids.filter((id) => id.startsWith("event."));
+    assert.equal(ids.length, 10);
+    assert.deepEqual(states, ["state.memory-3", "state.memory-2", "state.memory-1"]);
+    assert.equal(events.length, 7);
+    assert.deepEqual(events, [
+      "event.memory-15",
+      "event.memory-14",
+      "event.memory-13",
+      "event.memory-12",
+      "event.memory-11",
+      "event.memory-10",
+      "event.memory-9",
+    ]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("context backfills missing event quota with newest states", () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const memoryDir = getMemoryDir(settings, workspace);
+    for (let day = 1; day <= 8; day++) writeDatedMemory(memoryDir, "state", `memory-${day}`, day, "2026-10");
+    for (let day = 9; day <= 10; day++) writeDatedMemory(memoryDir, "event", `memory-${day}`, day, "2026-10");
+    const context = buildMemoryContext(settings, workspace);
+    const ids = injectedRecordIds(context);
+    const states = ids.filter((id) => id.startsWith("state."));
+    const events = ids.filter((id) => id.startsWith("event."));
+    assert.equal(ids.length, 10);
+    assert.equal(states.length, 8);
+    assert.equal(events.length, 2);
+    assert.deepEqual(states, [
+      "state.memory-8",
+      "state.memory-7",
+      "state.memory-6",
+      "state.memory-5",
+      "state.memory-4",
+      "state.memory-3",
+      "state.memory-2",
+      "state.memory-1",
+    ]);
+    assert.deepEqual(events, ["event.memory-10", "event.memory-9"]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("context injects only events when a project has no state records", () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const memoryDir = getMemoryDir(settings, workspace);
+    for (let day = 1; day <= 12; day++) writeDatedMemory(memoryDir, "event", `memory-${day}`, day, "2026-11");
+    const context = buildMemoryContext(settings, workspace);
+    const ids = injectedRecordIds(context);
+    assert.equal(ids.length, 10);
+    assert.equal(ids.filter((id) => id.startsWith("state.")).length, 0);
+    assert.equal(ids.filter((id) => id.startsWith("event.")).length, 10);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("context is empty for a project with no memory files", () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    assert.equal(buildMemoryContext(settings, workspace), "");
+    const memoryDir = getMemoryDir(settings, workspace);
+    fs.mkdirSync(memoryDir, { recursive: true });
+    assert.equal(buildMemoryContext(settings, workspace), "");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ============================================================================
+// Concept hygiene and memory_alias
+// ============================================================================
+
+test("concept hygiene blocks hash/number/date concepts and warns on sentence-like concepts", () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const memoryDir = getMemoryDir(settings, workspace);
+    fs.mkdirSync(memoryDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(memoryDir, ".concepts.json"),
+      `${JSON.stringify(
+        {
+          version: 1,
+          concepts: ["identity-addressed-record"],
+          aliases: {},
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+    const normalized = normalizeMemoryConcepts(memoryDir, [
+      "deadbeefcafef00d", // hex hash 7-40 chars
+      "42", // pure number
+      "3.14", // pure number
+      "2024-01-01", // YYYY-MM-DD date
+      "20240101", // YYYYMMDD date
+      "release-2025-03-01", // contains a date
+      "123456789", // 9+ digit number must warn as number, not date
+      "this is a very long concept sentence", // 7 words -> warn but register
+      "identity-addressed-record", // valid existing concept
+    ]);
+
+    assert.deepEqual(normalized.concepts, ["identity-addressed-record", "this-is-a-very-long-concept-sentence"]);
+    assert.equal(normalized.audit.warnings.length, 8);
+    assert.match(normalized.audit.warnings[0], /looks like a hash/);
+    assert.match(normalized.audit.warnings[1], /looks like a number/);
+    assert.match(normalized.audit.warnings[2], /looks like a number/);
+    assert.match(normalized.audit.warnings[3], /looks like a date/);
+    assert.match(normalized.audit.warnings[4], /looks like a date/);
+    assert.match(normalized.audit.warnings[5], /looks like a date/);
+    assert.match(normalized.audit.warnings[6], /looks like a number/);
+    assert.match(normalized.audit.warnings[7], /looks like a sentence/);
+
+    const dictionary = getConceptDictionary(memoryDir);
+    assert.deepEqual(dictionary.concepts, ["identity-addressed-record", "this-is-a-very-long-concept-sentence"]);
+    assert.equal(dictionary.concepts.includes("deadbeefcafef00d"), false);
+    assert.equal(dictionary.concepts.includes("42"), false);
+    assert.equal(dictionary.concepts.includes("2024-01-01"), false);
+    assert.equal(dictionary.concepts.includes("20240101"), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("memory_alias adds, converts, and rejects aliases", async () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const memoryDir = getMemoryDir(settings, workspace);
+    fs.mkdirSync(memoryDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(memoryDir, ".concepts.json"),
+      `${JSON.stringify(
+        {
+          version: 1,
+          concepts: ["identity-addressed-record", "metadata-cash", "metadata-cache"],
+          aliases: { "short-hand": "metadata-cache" },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+    // create new alias
+    const created = addConceptAlias(memoryDir, "id based record", "identity-addressed-record");
+    assert.equal(created.ok, true);
+    assert.equal(created.alias, "id-based-record");
+    assert.equal(created.canonical, "identity-addressed-record");
+    assert.equal(created.converted, false);
+    assert.equal(normalizeConceptSearchQuery(memoryDir, "id based record"), "identity-addressed-record");
+
+    // standalone concept -> alias conversion
+    const converted = addConceptAlias(memoryDir, "metadata-cash", "metadata-cache");
+    assert.equal(converted.ok, true);
+    assert.equal(converted.converted, true);
+    const dictionary = getConceptDictionary(memoryDir);
+    assert.equal(dictionary.concepts.includes("metadata-cash"), false);
+    assert.equal(dictionary.aliases["metadata-cash"], "metadata-cache");
+    assert.equal(normalizeConceptSearchQuery(memoryDir, "metadata cash"), "metadata-cache");
+
+    // canonical must exist in the dictionary
+    const missing = addConceptAlias(memoryDir, "whatever", "does-not-exist");
+    assert.equal(missing.ok, false);
+    assert.match(missing.error, /canonical concept not found/);
+
+    // conflict: alias is the canonical of another alias in use
+    const conflict = addConceptAlias(memoryDir, "metadata-cache", "identity-addressed-record");
+    assert.equal(conflict.ok, false);
+    assert.match(conflict.error, /canonical of another alias/);
+
+    // tool wiring round-trip
+    const { pi, tools } = fakePi();
+    registerMemoryAlias(pi, settings);
+    const signal = new AbortController().signal;
+    const toolResult = await tools
+      .get("memory_alias")
+      .execute("alias-1", { alias: "id-records", canonical: "identity-addressed-record" }, signal, () => {}, {
+        cwd: workspace,
+      });
+    assert.equal(toolResult.details.ok, true);
+    assert.match(toolResult.content[0].text, /Concept alias added: id-records -> identity-addressed-record/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ============================================================================
+// Sensitive detection and flag recomputation
+// ============================================================================
+
+test("sensitive detection requires credential-shaped token mentions", async () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const { pi, tools } = fakePi();
+    registerMemoryWrite(pi, settings);
+    const signal = new AbortController().signal;
+
+    const harmless = await tools.get("memory_write").execute(
+      "write-harmless",
+      {
+        path: "events/token-cost.md",
+        kind: "event",
+        description: "Token cost review",
+        summary: "LLM token usage summary",
+        claims: ["Bare token mentions should not be treated as sensitive"],
+      },
+      signal,
+      () => {},
+      { cwd: workspace },
+    );
+    assert.equal(harmless.details.frontmatter.sensitive, undefined);
+
+    const credential = await tools.get("memory_write").execute(
+      "write-credential",
+      {
+        path: "events/api-token.md",
+        kind: "event",
+        description: "API token rotation",
+        summary: "Access token replaced after rotation",
+        claims: ["Tokens should be rotated periodically"],
+      },
+      signal,
+      () => {},
+      { cwd: workspace },
+    );
+    assert.equal(credential.details.frontmatter.sensitive, true);
+    assert.match(credential.content[0].text, /Sensitive-looking content was marked sensitive/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("memory_write sensitive flag follows caller and recomputes from new content", async () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const { pi, tools } = fakePi();
+    registerMemoryWrite(pi, settings);
+    const signal = new AbortController().signal;
+    const write = (relPath, params) =>
+      tools
+        .get("memory_write")
+        .execute("write", { path: relPath, kind: "state", ...params }, signal, () => {}, { cwd: workspace });
+
+    // branch 1: explicit sensitive: true wins over harmless content
+    const explicit = await write("state/flag.md", {
+      description: "Flagged",
+      summary: "Explicitly sensitive",
+      sensitive: true,
+      claims: ["Caller controls the flag"],
+    });
+    assert.equal(explicit.details.frontmatter.sensitive, true);
+
+    // branch 2: explicit sensitive: false clears a previously sensitive record
+    const cleared = await write("state/flag.md", {
+      description: "Unflagged",
+      summary: "No longer sensitive",
+      sensitive: false,
+      claims: ["Caller clears the flag"],
+    });
+    assert.equal(cleared.details.frontmatter.sensitive, undefined);
+
+    // branch 3: no explicit flag + harmless new content recomputes instead of inheriting the old flag
+    await write("state/flag.md", {
+      description: "Sensitive secret path",
+      summary: "Contains api_token details",
+      claims: ["Stored as sensitive"],
+    });
+    const recomputed = await write("state/flag.md", {
+      description: "Public note",
+      summary: "Plain metadata",
+      claims: ["No longer sensitive-looking"],
+    });
+    assert.equal(recomputed.details.frontmatter.sensitive, undefined);
+    assert.doesNotMatch(recomputed.content[0].text, /marked sensitive/);
+
+    // and stays sensitive when the new content still looks sensitive
+    const kept = await write("state/flag.md", {
+      description: "Still secret",
+      summary: "Password rotation completed",
+      claims: ["Stays sensitive"],
+    });
+    assert.equal(kept.details.frontmatter.sensitive, true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("memory_search finds records stored under a concept later converted to an alias", async () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const memoryDir = getMemoryDir(settings, workspace);
+    fs.mkdirSync(memoryDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(memoryDir, ".concepts.json"),
+      `${JSON.stringify(
+        {
+          version: 1,
+          concepts: ["metadata-cache", "metadata-cash"],
+          aliases: {},
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+    const { pi, tools } = fakePi();
+    registerMemoryWrite(pi, settings);
+    registerMemorySearch(pi, settings);
+    registerMemoryAlias(pi, settings);
+    const signal = new AbortController().signal;
+
+    // record written while "metadata-cash" was still a standalone concept
+    await tools.get("memory_write").execute(
+      "write-1",
+      {
+        path: "events/pre-alias.md",
+        kind: "event",
+        description: "Pre alias record",
+        summary: "Stored under metadata-cash before conversion",
+        concepts: ["metadata-cash"],
+        claims: ["Concept later converted to an alias"],
+      },
+      signal,
+      () => {},
+      { cwd: workspace },
+    );
+    // record written under the canonical
+    await tools.get("memory_write").execute(
+      "write-2",
+      {
+        path: "events/post-alias.md",
+        kind: "event",
+        description: "Canonical record",
+        summary: "Stored under metadata-cache",
+        concepts: ["metadata-cache"],
+        claims: ["Canonical concept"],
+      },
+      signal,
+      () => {},
+      { cwd: workspace },
+    );
+
+    // convert the standalone concept into an alias
+    const alias = await tools
+      .get("memory_alias")
+      .execute("alias-1", { alias: "metadata-cash", canonical: "metadata-cache" }, signal, () => {}, {
+        cwd: workspace,
+      });
+    assert.equal(alias.details.ok, true);
+
+    // query by the alias name
+    const byAlias = await tools
+      .get("memory_search")
+      .execute("search-1", { query: "metadata cash", searchIn: "concepts" }, signal, () => {}, { cwd: workspace });
+    assert.equal(byAlias.details.query, "metadata-cache");
+    assert.equal(byAlias.details.count, 2);
+    assert.deepEqual(
+      byAlias.details.results.map((r) => r.path),
+      [path.join("records", "event.post-alias.md"), path.join("records", "event.pre-alias.md")],
+    );
+
+    // query by the canonical name
+    const byCanonical = await tools
+      .get("memory_search")
+      .execute("search-2", { query: "metadata-cache", searchIn: "concepts" }, signal, () => {}, { cwd: workspace });
+    assert.equal(byCanonical.details.query, "metadata-cache");
+    assert.equal(byCanonical.details.count, 2);
+    assert.deepEqual(
+      byCanonical.details.results.map((r) => r.path),
+      [path.join("records", "event.post-alias.md"), path.join("records", "event.pre-alias.md")],
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("memory_write surfaces hygiene warnings for blocked concepts in response text", async () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const { pi, tools } = fakePi();
+    registerMemoryWrite(pi, settings);
+    const result = await tools.get("memory_write").execute(
+      "write-hygiene",
+      {
+        path: "events/hygiene.md",
+        kind: "event",
+        description: "Hygiene warning test",
+        summary: "Blocked concepts must be visible in the response",
+        concepts: ["deadbeefcafef00d", "20260101", "ok-concept"],
+        claims: ["Blocked concepts are dropped with a visible warning"],
+      },
+      new AbortController().signal,
+      () => {},
+      { cwd: workspace },
+    );
+    assert.match(result.content[0].text, /Memory file written/);
+    assert.match(result.content[0].text, /looks like a hash/);
+    assert.match(result.content[0].text, /looks like a date/);
+    assert.deepEqual(result.details.frontmatter.concepts, ["ok-concept"]);
+    assert.ok(result.details.warnings.some((warning) => /looks like a hash/.test(warning)));
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

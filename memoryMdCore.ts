@@ -4,6 +4,7 @@ import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { parseFrontmatter, stringifyFrontmatter } from "./frontmatter.js";
 import type {
+  ConceptAliasResult,
   ConceptDictionary,
   ConceptDuplicateHint,
   ConceptNormalizationAudit,
@@ -669,7 +670,7 @@ function conceptDictionaryPath(memoryDir: string): string {
 }
 
 function emptyConceptAudit(): ConceptNormalizationAudit {
-  return { canonical: [], resolvedAliases: {}, registered: [], possibleDuplicates: [] };
+  return { canonical: [], resolvedAliases: {}, registered: [], possibleDuplicates: [], warnings: [] };
 }
 
 export function normalizeConceptLabel(label: string): string {
@@ -823,6 +824,19 @@ function normalizeKnownConceptSequence(dictionary: ConceptDictionary, query: str
   return concepts;
 }
 
+function conceptHygieneBlockWarning(concept: string, normalized: string): string | null {
+  if (/^(?=.*[a-f])[0-9a-f]{7,40}$/.test(normalized)) {
+    return `Concept "${concept}" looks like a hash; move it into facts instead of concepts.`;
+  }
+  if (/\d{4}-\d{2}-\d{2}/.test(normalized) || /(?:^|\D)\d{8}(?:\D|$)/.test(normalized)) {
+    return `Concept "${concept}" looks like a date; move it into facts or tags instead of concepts.`;
+  }
+  if (/^[0-9][0-9.-]*$/.test(normalized)) {
+    return `Concept "${concept}" looks like a number; move it into facts or tags instead of concepts.`;
+  }
+  return null;
+}
+
 export function normalizeMemoryConcepts(
   memoryDir: string,
   concepts?: string[],
@@ -835,10 +849,20 @@ export function normalizeMemoryConcepts(
   const canonical = new Set<string>();
 
   for (const concept of concepts) {
+    const normalized = normalizeConceptLabel(concept);
+    if (!normalized) continue;
+    const blockedWarning = conceptHygieneBlockWarning(concept, normalized);
+    if (blockedWarning) {
+      audit.warnings.push(blockedWarning);
+      continue;
+    }
+    if (normalized.split("-").length >= 6) {
+      audit.warnings.push(`Concept "${concept}" looks like a sentence; prefer capturing it as a claim.`);
+    }
     const resolved = resolveConcept(dictionary, concept);
     if (!resolved) continue;
     canonical.add(resolved.canonical);
-    if (resolved.alias) audit.resolvedAliases[normalizeConceptLabel(concept)] = resolved.canonical;
+    if (resolved.alias) audit.resolvedAliases[normalized] = resolved.canonical;
     if (!knownBefore.has(resolved.canonical)) {
       audit.registered.push(resolved.canonical);
       audit.possibleDuplicates.push(...possibleDuplicateHints(resolved.canonical, dictionary.concepts));
@@ -869,6 +893,49 @@ export function normalizeConceptSearchQuery(memoryDir: string, query: string): s
   if (whole) return whole;
   const sequence = normalizeKnownConceptSequence(dictionary, query);
   return sequence ? uniqueSorted(sequence).join(" ") : normalizeConceptLabel(query);
+}
+
+export function addConceptAlias(memoryDir: string, alias: string, canonical: string): ConceptAliasResult {
+  const normalizedAlias = normalizeConceptLabel(alias);
+  const normalizedCanonical = normalizeConceptLabel(canonical);
+  if (!normalizedAlias || !normalizedCanonical) {
+    return { ok: false, error: "alias and canonical must be non-empty concept labels" };
+  }
+  if (normalizedAlias === normalizedCanonical) {
+    return { ok: false, error: "alias must differ from the canonical concept" };
+  }
+
+  const dictionary = getConceptDictionary(memoryDir);
+  const resolvedCanonical = dictionary.aliases[normalizedCanonical] ?? normalizedCanonical;
+  if (!dictionary.concepts.includes(resolvedCanonical)) {
+    return { ok: false, error: `canonical concept not found in dictionary: ${normalizedCanonical}` };
+  }
+  if (Object.values(dictionary.aliases).includes(normalizedAlias)) {
+    return { ok: false, error: `alias is the canonical of another alias in use: ${normalizedAlias}` };
+  }
+  if (dictionary.aliases[normalizedAlias] === resolvedCanonical) {
+    return { ok: true, alias: normalizedAlias, canonical: resolvedCanonical };
+  }
+  if (dictionary.aliases[normalizedAlias]) {
+    return { ok: false, error: `alias already maps to ${dictionary.aliases[normalizedAlias]}` };
+  }
+
+  const converted = dictionary.concepts.includes(normalizedAlias);
+  if (converted) dictionary.concepts = dictionary.concepts.filter((concept) => concept !== normalizedAlias);
+  dictionary.aliases[normalizedAlias] = resolvedCanonical;
+  writeConceptDictionary(memoryDir, dictionary);
+  return { ok: true, alias: normalizedAlias, canonical: resolvedCanonical, converted };
+}
+
+export function expandConceptSearchFamilies(memoryDir: string, canonicalTerms: string[]): string[][] {
+  const dictionary = getConceptDictionary(memoryDir);
+  return canonicalTerms.map((term) => {
+    const family = new Set<string>([term]);
+    for (const [alias, target] of Object.entries(dictionary.aliases)) {
+      if (target === term) family.add(alias);
+    }
+    return [...family];
+  });
 }
 function isMemoryFactValue(value: unknown): value is MemoryFactValue {
   if (value === null) return true;
@@ -1508,6 +1575,7 @@ function createDefaultFiles(memoryDir: string): void {
 export { createDefaultFiles, ensureDirectoryStructure };
 
 const MAX_INJECTED_MEMORY_FILES = 10;
+const STATE_INJECTION_QUOTA = 5;
 
 function memoryTimestamp(filePath: string, frontmatter: MemoryFrontmatter): number {
   for (const value of [frontmatter.updated, frontmatter.created]) {
@@ -1522,14 +1590,37 @@ export function buildMemoryContext(settings: MemoryMdSettings, cwd: string): str
   const memoryDir = getMemoryDir(settings, cwd);
   if (!fs.existsSync(memoryDir)) return "";
 
-  const memories = getMemoryCatalog(memoryDir)
+  const candidates = getMemoryCatalog(memoryDir)
     .filter((entry) => !entry.sensitive)
     .sort(
       (a, b) =>
         memoryTimestamp(path.join(memoryDir, b.path), b) - memoryTimestamp(path.join(memoryDir, a.path), a) ||
         a.path.localeCompare(b.path),
-    )
-    .slice(0, MAX_INJECTED_MEMORY_FILES);
+    );
+
+  // Reserve up to STATE_INJECTION_QUOTA slots for the newest state records and the rest for the newest
+  // events, with two-way backfill: a shortfall on either kind is filled by the newest records of the
+  // other kind, capped at MAX_INJECTED_MEMORY_FILES total.
+  const eventQuota = MAX_INJECTED_MEMORY_FILES - STATE_INJECTION_QUOTA;
+  const states = candidates.filter((entry) => entry.kind === "state");
+  const events = candidates.filter((entry) => entry.kind !== "state");
+  const topStates = states.slice(0, STATE_INJECTION_QUOTA);
+  const topEvents = events.slice(0, eventQuota);
+  const selectedPaths = new Set<string>([...topStates, ...topEvents].map((entry) => entry.path));
+  for (const [shortfall, fillWith] of [
+    [STATE_INJECTION_QUOTA - topStates.length, events],
+    [eventQuota - topEvents.length, states],
+  ] as Array<[number, MemoryCatalogEntry[]]>) {
+    let filled = 0;
+    for (const entry of fillWith) {
+      if (selectedPaths.size >= MAX_INJECTED_MEMORY_FILES) break;
+      if (selectedPaths.has(entry.path)) continue;
+      selectedPaths.add(entry.path);
+      filled += 1;
+      if (filled >= shortfall) break;
+    }
+  }
+  const memories = candidates.filter((entry) => selectedPaths.has(entry.path));
   if (memories.length === 0) return "";
 
   const lines: string[] = [
