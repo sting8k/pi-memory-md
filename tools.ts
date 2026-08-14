@@ -11,20 +11,29 @@ import {
   deleteMemoryFile,
   ensureDirectoryStructure,
   expandConceptSearchFamilies,
+  filterSupersededEntries,
+  findCompactClusters,
+  findConceptContainmentDuplicate,
+  findIdFamilyRoute,
+  findMemoryFileById,
   formatMemoryRead,
   getCurrentDate,
   getMemoryCatalog,
   getMemoryDir,
   gitExec,
+  isDatedMemoryId,
   listMemoryFiles,
+  markRecordSuperseded,
   memoryFileFromCatalogEntry,
   migrateMemoryProject,
   normalizeConceptSearchQuery,
   normalizeMemoryConcepts,
   readMemoryFile,
+  rebuildMemoryCatalog,
   resolveMemoryFile,
   resolveMemoryPath,
   resolveMemoryWriteTarget,
+  supersededByExists,
   syncRepository,
   upsertMemoryCatalog,
   validateMemoryContent,
@@ -486,8 +495,13 @@ export function registerMemoryRead(pi: ExtensionAPI, settings: MemoryMdSettings)
         const memory = readMemoryFile(fullPath);
         if (!memory) throw new Error("File could not be parsed");
 
+        const supersededNote =
+          memory.frontmatter.supersededBy && findMemoryFileById(memoryDir, memory.frontmatter.supersededBy)
+            ? `\n\nNote: superseded by @${memory.frontmatter.supersededBy}`
+            : "";
+
         return {
-          content: [{ type: "text", text: formatMemoryRead(memory, view) }],
+          content: [{ type: "text", text: `${formatMemoryRead(memory, view)}${supersededNote}` }],
           details: { path: path.relative(memoryDir, fullPath), frontmatter: memory.frontmatter, view },
         };
       } catch (error) {
@@ -533,6 +547,14 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
           description: "Optional lifecycle; inferred from logical path or record ID and must match it",
         }),
       ),
+      forceCreate: Type.Optional(
+        Type.Boolean({ description: "Bypass the dated-ID block and pre-commit dedup checks and force a fresh record" }),
+      ),
+      supersedes: Type.Optional(
+        Type.Array(
+          Type.String({ description: "Stable @id or path of records this write replaces; they are marked superseded" }),
+        ),
+      ),
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -549,6 +571,8 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
         tags,
         sensitive,
         kind: requestedKind,
+        forceCreate,
+        supersedes,
       } = params as {
         path: string;
         content?: string;
@@ -556,6 +580,8 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
         tags?: string[];
         sensitive?: boolean;
         kind?: "state" | "event";
+        forceCreate?: boolean;
+        supersedes?: string[];
       } & StructuredMemoryFields;
       const memoryDir = getMemoryDir(settings, ctx.cwd);
 
@@ -604,17 +630,58 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
         const legacyPath = resolveMemoryPath(memoryDir, relPath);
         const legacyExists = fs.existsSync(legacyPath);
         const legacyExisting = legacyExists ? readMemoryFile(legacyPath) : null;
-        const target = resolveMemoryWriteTarget(
+        let target = resolveMemoryWriteTarget(
           memoryDir,
           relPath,
           requestedKind,
           legacyExisting?.frontmatter.id,
           legacyExisting?.frontmatter.kind,
         );
-        const targetExists = fs.existsSync(target.filePath);
-        const existingPath = targetExists ? target.filePath : legacyExists && legacyExisting ? legacyPath : null;
+        let targetExists = fs.existsSync(target.filePath);
+        let existingPath = targetExists ? target.filePath : legacyExists && legacyExisting ? legacyPath : null;
+
+        // Pre-commit lifecycle guard: dated state IDs are refused (they read as events).
+        if (!forceCreate && target.kind === "state" && isDatedMemoryId(target.id)) {
+          throw new Error(
+            `Memory ID '@${target.id}' looks like a dated event ID. Events are append-only; write it with kind:'event', or pass forceCreate:true to use a dated state ID.`,
+          );
+        }
+
+        // Pre-commit dedup for state creates only (events are append-only and untouched):
+        // deterministic ID-family routes to an overwrite; concept containment rejects with a hint.
+        let routedTo: string | null = null;
+        if (!forceCreate && !targetExists && target.kind === "state") {
+          const route = findIdFamilyRoute(memoryDir, target.id);
+          if (route) {
+            target = { filePath: route.filePath, id: route.id, kind: "state" };
+            targetExists = true;
+            existingPath = target.filePath;
+            routedTo = route.id;
+          } else {
+            const containment = findConceptContainmentDuplicate(memoryDir, target.kind, normalizedConcepts ?? []);
+            if (containment) {
+              throw new Error(
+                `Similar state record @${containment.id} exists (concepts: ${containment.concepts.join(", ")}). Overwrite it by writing to '${containment.path}', or pass forceCreate:true to create a separate record.`,
+              );
+            }
+          }
+        }
+
         const beforeRaw = existingPath ? fs.readFileSync(existingPath, "utf-8") : undefined;
         const existing = targetExists ? readMemoryFile(target.filePath) : legacyExisting;
+
+        // Validate supersede targets before any file is touched, so a bad reference never leaves
+        // a half-applied write behind.
+        const supersedeTargets: Array<{ filePath: string; id: string }> = [];
+        if (supersedes?.length) {
+          for (const ref of supersedes) {
+            const filePath = resolveMemoryFile(memoryDir, ref);
+            const memory = readMemoryFile(filePath);
+            if (!memory?.frontmatter.id) throw new Error(`Supersede target not found: ${ref}`);
+            if (memory.frontmatter.id === target.id) throw new Error(`A record cannot supersede itself: ${ref}`);
+            supersedeTargets.push({ filePath, id: memory.frontmatter.id });
+          }
+        }
 
         const finalSensitive = sensitive === undefined ? detectedSensitive : sensitive;
         const today = getCurrentDate();
@@ -637,6 +704,13 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
         const afterRaw = fs.readFileSync(target.filePath, "utf-8");
         const overwriteDiff = beforeRaw === undefined ? undefined : buildMemoryOverwriteDiff(beforeRaw, afterRaw);
         upsertMemoryCatalog(memoryDir, target.filePath);
+        // Mark superseded targets after the new record exists, so supersededBy always points
+        // at a live record.
+        const supersededIds: string[] = [];
+        for (const supersedeTarget of supersedeTargets) {
+          markRecordSuperseded(memoryDir, supersedeTarget.filePath, target.id);
+          supersededIds.push(supersedeTarget.id);
+        }
         const relTarget = path.relative(memoryDir, target.filePath);
         const duplicateHints = formatConceptDuplicateHints(conceptNormalization.audit.possibleDuplicates);
         const writeWarnings = formatMemoryWriteWarnings(
@@ -651,23 +725,25 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
           }),
         );
         const operation = beforeRaw === undefined ? "create" : "overwrite";
-        const status =
-          operation === "overwrite"
+        const status = routedTo
+          ? `Memory file routed to overwrite: ${relTarget} (@${target.id}) (ID-family match)`
+          : operation === "overwrite"
             ? `Memory file overwritten: ${relTarget} (@${target.id})`
             : `Memory file written: ${relTarget} (@${target.id})`;
+        const responseParts = [status];
+        if (supersededIds.length) responseParts.push(`Superseded: ${supersededIds.map((id) => `@${id}`).join(", ")}`);
+        if (overwriteDiff?.text) responseParts.push(overwriteDiff.text);
+        if (duplicateHints) responseParts.push(duplicateHints);
+        if (writeWarnings) responseParts.push(writeWarnings);
         return {
-          content: [
-            {
-              type: "text",
-              text: [status, overwriteDiff?.text, duplicateHints, writeWarnings].filter(Boolean).join("\n\n"),
-            },
-          ],
+          content: [{ type: "text", text: responseParts.join("\n\n") }],
           details: {
             path: target.filePath,
             operation,
             diff: overwriteDiff,
             frontmatter: { ...frontmatter, id: target.id, kind: target.kind },
             concepts: conceptNormalization.audit,
+            superseded: supersededIds,
             warnings: buildMemoryWriteWarnings({
               summary,
               claims,
@@ -711,15 +787,20 @@ export function registerMemoryList(pi: ExtensionAPI, settings: MemoryMdSettings)
     description: "List current-project memory files with stable IDs and lifecycle kinds",
     parameters: Type.Object({
       directory: Type.Optional(Type.String({ description: "Filter by state or events" })),
+      includeSuperseded: Type.Optional(
+        Type.Boolean({ description: "Include records hidden because a newer record supersedes them" }),
+      ),
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const { directory } = params as { directory?: string };
+      const { directory, includeSuperseded } = params as { directory?: string; includeSuperseded?: boolean };
       const memoryDir = getMemoryDir(settings, ctx.cwd);
 
       try {
         const normalizedDirectory = directory?.replace(/\/$/, "");
-        const entries = getMemoryCatalog(memoryDir)
+        const catalogEntries = getMemoryCatalog(memoryDir);
+        const visibleEntries = includeSuperseded ? catalogEntries : filterSupersededEntries(memoryDir, catalogEntries);
+        const entries = visibleEntries
           .filter((entry) => {
             if (!normalizedDirectory) return true;
             if (normalizedDirectory === "state") return entry.kind === "state";
@@ -731,10 +812,12 @@ export function registerMemoryList(pi: ExtensionAPI, settings: MemoryMdSettings)
             id: entry.id,
             kind: entry.kind,
             description: entry.description,
+            supersededBy: entry.supersededBy,
           }));
         const text = entries
           .map(
-            (entry) => `  - ${entry.path} (@${entry.id})\n    ${entry.kind}: ${entry.description ?? "No description"}`,
+            (entry) =>
+              `  - ${entry.path} (@${entry.id})${entry.supersededBy ? ` (superseded by @${entry.supersededBy})` : ""}\n    ${entry.kind}: ${entry.description ?? "No description"}`,
           )
           .join("\n");
         return {
@@ -769,8 +852,14 @@ export function registerMemoryDelete(pi: ExtensionAPI, settings: MemoryMdSetting
       const memoryDir = getMemoryDir(settings, ctx.cwd);
       try {
         const deleted = deleteMemoryFile(memoryDir, target);
+        const responseParts = [`Memory deleted: ${deleted.path} (@${deleted.id})`];
+        if (deleted.unhidden.length) {
+          responseParts.push(
+            `Superseded markers cleared (resurrected): ${deleted.unhidden.map((id) => `@${id}`).join(", ")}`,
+          );
+        }
         return {
-          content: [{ type: "text", text: `Memory deleted: ${deleted.path} (@${deleted.id})` }],
+          content: [{ type: "text", text: responseParts.join("\n\n") }],
           details: { ...deleted, conceptCount: deleted.dictionary.concepts.length },
         };
       } catch (error) {
@@ -1053,14 +1142,25 @@ export function registerMemoryCheck(pi: ExtensionAPI, settings: MemoryMdSettings
 
       const files = listMemoryFiles(memoryDir);
       const relPaths = files.map((f) => path.relative(memoryDir, f));
+      // Read-only compact discovery: clusters of same-kind records sharing a canonical concept.
+      const clusters = findCompactClusters(memoryDir);
+      let discoveryText = "";
+      if (clusters.length) {
+        const sections = clusters.map((cluster) => {
+          const ids = cluster.ids.map((id) => `@${id}`);
+          const sample = `memory_compact({ path: "state/${cluster.concept}-summary.md", description: "${cluster.concept} lifecycle summary", supersede: [${cluster.ids.map((id) => `"@${id}"`).join(", ")}] })`;
+          return `- ${cluster.ids.length} ${cluster.kind} records share concept "${cluster.concept}", candidates for memory_compact: [${ids.join(", ")}]\n  Sample: ${sample}`;
+        });
+        discoveryText = `\n\nCompact discovery (${clusters.length} cluster${clusters.length > 1 ? "s" : ""}):\n${sections.join("\n")}`;
+      }
       return {
         content: [
           {
             type: "text",
-            text: `Memory directory structure for project: ${path.basename(ctx.cwd)}\n\nPath: ${memoryDir}\n\n${treeOutput}\n\nMemory files (${relPaths.length}):\n${relPaths.map((p) => `  ${p}`).join("\n")}`,
+            text: `Memory directory structure for project: ${path.basename(ctx.cwd)}\n\nPath: ${memoryDir}\n\n${treeOutput}\n\nMemory files (${relPaths.length}):\n${relPaths.map((p) => `  ${p}`).join("\n")}${discoveryText}`,
           },
         ],
-        details: { path: memoryDir, fileCount: relPaths.length },
+        details: { path: memoryDir, fileCount: relPaths.length, clusters },
       };
     },
 
@@ -1070,6 +1170,235 @@ export function registerMemoryCheck(pi: ExtensionAPI, settings: MemoryMdSettings
       const details = result.details as { exists?: boolean; fileCount?: number };
       const summary = (details?.exists ?? true) ? `Structure: ${details?.fileCount ?? 0} files` : "Not initialized";
       return renderCollapsed(summary, getResultText(result), options, theme);
+    },
+  });
+}
+
+export function registerMemoryCompact(pi: ExtensionAPI, settings: MemoryMdSettings): void {
+  pi.registerTool({
+    name: "memory_compact",
+    label: "Memory Compact",
+    description:
+      "Write a distilled state record, then mark every explicitly listed supersede @id as superseded so it drops out of injection and listings. The distill record is written FIRST, then the supersede markers are applied, so an interrupted run leaves the new state plus a few not-yet-hidden records (harmless duplication) instead of lost information.",
+    parameters: Type.Object({
+      path: Type.String({
+        description: "Relative .md path for the distilled state record (state/ or records/state.*.md)",
+      }),
+      description: Type.String({ description: "Concise purpose shown in the recent-memory index" }),
+      summary: Type.Optional(Type.String({ description: "One-sentence semantic summary for compact reads" })),
+      concepts: Type.Optional(Type.Array(Type.String({ description: "Core concepts captured by this memory" }))),
+      claims: Type.Optional(Type.Array(Type.String({ description: "Important conclusions or decisions" }))),
+      facts: Type.Optional(
+        Type.Record(Type.String(), Type.Any({ description: "Machine-readable scalar/array fact values" })),
+      ),
+      relations: Type.Optional(Type.Record(Type.String(), Type.String({ description: "Relation target stable @id" }))),
+      notes: Type.Optional(Type.String({ description: "Optional prose/evidence rendered after structured knowledge" })),
+      tags: Type.Optional(Type.Array(Type.String())),
+      supersede: Type.Array(
+        Type.String({
+          description: "Explicit @id or path of records this distill absorbs; they are marked superseded",
+        }),
+      ),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const memoryDir = getMemoryDir(settings, ctx.cwd);
+      try {
+        const {
+          path: relPath,
+          description,
+          summary,
+          concepts,
+          claims,
+          facts,
+          relations,
+          notes,
+          tags,
+          supersede,
+        } = params as {
+          path: string;
+          description: string;
+          tags?: string[];
+          supersede: string[];
+        } & StructuredMemoryFields;
+        if (!supersede?.length) throw new Error("memory_compact requires a supersede list of @ids or paths to absorb");
+
+        // Validate every supersede target BEFORE any file is touched: missing ids abort the
+        // whole call, already-superseded ids are skipped later (reported, not fatal).
+        const targets = supersede.map((ref) => {
+          const filePath = resolveMemoryFile(memoryDir, ref);
+          const memory = readMemoryFile(filePath);
+          if (!memory?.frontmatter.id) throw new Error(`Supersede target not found: ${ref}`);
+          return { filePath, id: memory.frontmatter.id, frontmatter: memory.frontmatter };
+        });
+
+        // memory_compact always produces a state record.
+        const target = resolveMemoryWriteTarget(memoryDir, relPath, "state");
+        if (target.kind !== "state") {
+          throw new Error("memory_compact writes a state record; use a state path or records/state.*.md");
+        }
+
+        const conceptNormalization = normalizeMemoryConcepts(memoryDir, concepts);
+        const normalizedConcepts = conceptNormalization.concepts;
+        const memoryContent = buildStructuredMemoryContent({
+          description,
+          summary,
+          concepts: normalizedConcepts,
+          claims,
+          facts,
+          relations,
+          notes,
+        });
+        const detectedSensitive = hasSensitiveMemoryInput({
+          content: memoryContent,
+          concepts: normalizedConcepts,
+          description,
+          facts,
+          relations,
+          summary,
+          claims,
+          notes,
+          tags,
+        });
+        const contentValidation = validateMemoryContent(memoryContent);
+        if (!contentValidation.valid) throw new Error(contentValidation.error);
+
+        const targetExists = fs.existsSync(target.filePath);
+        const existing = targetExists ? readMemoryFile(target.filePath) : null;
+        const beforeRaw = targetExists ? fs.readFileSync(target.filePath, "utf-8") : undefined;
+        const today = getCurrentDate();
+        const frontmatter: MemoryFrontmatter = {
+          ...existing?.frontmatter,
+          description,
+          summary,
+          concepts: normalizedConcepts,
+          claims,
+          created: existing?.frontmatter.created ?? today,
+          updated: today,
+          ...(tags && { tags }),
+        };
+        if (detectedSensitive) frontmatter.sensitive = true;
+        else delete frontmatter.sensitive;
+        delete frontmatter.id;
+        delete frontmatter.kind;
+        delete frontmatter.supersededBy;
+
+        // Step 1: write the distilled state record FIRST. If a later step fails, the state
+        // exists and only some markers are missing - harmless duplication, never data loss.
+        writeMemoryFile(target.filePath, memoryContent, frontmatter);
+        upsertMemoryCatalog(memoryDir, target.filePath);
+
+        // Step 2: mark each target superseded, with best-effort restore on failure. This is
+        // NOT an all-or-nothing mechanism - mirrors rollbackMergeWrites: we undo what we can
+        // (delete the fresh distill, clear markers already written) and say so honestly.
+        const marked: string[] = [];
+        const skipped: Array<{ id: string; reason: string }> = [];
+        try {
+          for (const targetRecord of targets) {
+            if (targetRecord.id === target.id) {
+              skipped.push({ id: targetRecord.id, reason: "is the new distill record itself" });
+              continue;
+            }
+            if (
+              targetRecord.frontmatter.supersededBy &&
+              supersededByExists(memoryDir, targetRecord.frontmatter.supersededBy)
+            ) {
+              skipped.push({
+                id: targetRecord.id,
+                reason: `already superseded by @${targetRecord.frontmatter.supersededBy}`,
+              });
+              continue;
+            }
+            markRecordSuperseded(memoryDir, targetRecord.filePath, target.id);
+            marked.push(targetRecord.id);
+          }
+        } catch (error) {
+          // Best-effort restore (not a guarantee): restore the distill target (prior bytes
+          // when it pre-existed, otherwise delete the fresh record) and clear the markers
+          // already applied, then let the caller see the failure.
+          try {
+            if (targetExists && beforeRaw !== undefined) {
+              fs.writeFileSync(target.filePath, beforeRaw);
+            } else {
+              fs.rmSync(target.filePath, { force: true });
+            }
+          } catch {
+            // ignore: the restore write failed or the file was already gone
+          }
+          for (const id of marked) {
+            try {
+              const markedPath = findMemoryFileById(memoryDir, id);
+              const markedMemory = markedPath ? readMemoryFile(markedPath) : null;
+              if (markedPath && markedMemory) {
+                const restored = { ...markedMemory.frontmatter };
+                delete restored.supersededBy;
+                writeMemoryFile(markedPath, markedMemory.content, restored);
+              }
+            } catch {
+              // ignore per-record restore failures
+            }
+          }
+          rebuildMemoryCatalog(memoryDir);
+          throw new Error(`memory_compact failed partway and was rolled back best-effort: ${(error as Error).message}`);
+        }
+
+        const relTarget = path.relative(memoryDir, target.filePath);
+        const duplicateHints = formatConceptDuplicateHints(conceptNormalization.audit.possibleDuplicates);
+        const writeWarnings = formatMemoryWriteWarnings(
+          buildMemoryWriteWarnings({
+            summary,
+            claims,
+            facts,
+            content: undefined,
+            finalSensitive: detectedSensitive,
+            detectedSensitive,
+            hygieneWarnings: conceptNormalization.audit.warnings,
+          }),
+        );
+        const responseParts = [`Memory compact written: ${relTarget} (@${target.id})`];
+        if (marked.length) responseParts.push(`Superseded: ${marked.map((id) => `@${id}`).join(", ")}`);
+        if (skipped.length) {
+          responseParts.push(`Skipped: ${skipped.map((entry) => `@${entry.id} (${entry.reason})`).join(", ")}`);
+        }
+        if (duplicateHints) responseParts.push(duplicateHints);
+        if (writeWarnings) responseParts.push(writeWarnings);
+        return {
+          content: [{ type: "text", text: responseParts.join("\n\n") }],
+          details: {
+            path: target.filePath,
+            frontmatter: { ...frontmatter, id: target.id, kind: target.kind },
+            superseded: marked,
+            skipped,
+            warnings: buildMemoryWriteWarnings({
+              summary,
+              claims,
+              facts,
+              content: undefined,
+              finalSensitive: detectedSensitive,
+              detectedSensitive,
+              hygieneWarnings: conceptNormalization.audit.warnings,
+            }),
+          },
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Failed to compact memory: ${(error as Error).message}` }],
+          details: { error: true },
+        };
+      }
+    },
+
+    renderCall: (args, theme) => new Text(buildToolCallText("memory_compact", args, theme), 0, 0),
+    renderResult: (result, options, theme) => {
+      const details = result.details as { frontmatter?: { description?: string }; superseded?: string[] };
+      return renderCollapsed(
+        details?.superseded?.length
+          ? `Compact: absorbed ${details.superseded.length} record${details.superseded.length > 1 ? "s" : ""}`
+          : "Memory compact",
+        getResultText(result),
+        options,
+        theme,
+      );
     },
   });
 }
@@ -1087,4 +1416,6 @@ export function registerAllMemoryTools(
   registerMemoryDelete(pi, settings);
   registerMemoryInit(pi, settings, isRepoInitialized);
   registerMemoryMigrate(pi, settings);
+  registerMemoryCheck(pi, settings);
+  registerMemoryCompact(pi, settings);
 }

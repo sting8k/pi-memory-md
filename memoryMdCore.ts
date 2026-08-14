@@ -617,7 +617,7 @@ export const MEMORY_FACTS_END = "<!-- /memory:facts -->";
 const MEMORY_KEY_PATTERN = /^[a-z][a-z0-9_.-]*$/;
 const MEMORY_RECORDS_DIR = "records";
 const MEMORY_CATALOG_FILE = ".catalog.json";
-const MEMORY_CATALOG_VERSION = 4;
+const MEMORY_CATALOG_VERSION = 5;
 const CONCEPT_DICTIONARY_FILE = ".concepts.json";
 
 export interface MemoryCatalogEntry {
@@ -634,6 +634,7 @@ export interface MemoryCatalogEntry {
   updated?: string;
   mtimeMs: number;
   size: number;
+  supersededBy?: string;
 }
 
 interface MemoryCatalog {
@@ -1409,9 +1410,171 @@ function catalogEntryFromMemory(memoryDir: string, filePath: string): MemoryCata
     tags: memory.frontmatter.tags ?? [],
     created: memory.frontmatter.created,
     updated: memory.frontmatter.updated,
+    supersededBy: memory.frontmatter.supersededBy,
     mtimeMs: stats.mtimeMs,
     size: stats.size,
   };
+}
+
+/**
+ * Lifecycle: supersedes tombstone + derived hiding
+ *
+ * A record is hidden when its frontmatter carries supersededBy pointing at a record
+ * that still exists. Hidden-ness is DERIVED at read time; nothing is persisted beyond
+ * the marker on the old record. Chains resolve naturally: C -> B -> A means both B and
+ * C are hidden while A exists, and deleting A un-hides B (its superseder is gone) while
+ * C stays hidden (its superseder B still exists).
+ */
+
+export function supersededByExists(memoryDir: string, id: string): boolean {
+  const normalized = normalizeMemoryId(id);
+  if (fs.existsSync(recordPathForId(memoryDir, normalized))) return true;
+  return getMemoryCatalog(memoryDir).some((entry) => entry.id === normalized);
+}
+
+export function filterSupersededEntries(memoryDir: string, entries: MemoryCatalogEntry[]): MemoryCatalogEntry[] {
+  return entries.filter((entry) => !entry.supersededBy || !supersededByExists(memoryDir, entry.supersededBy));
+}
+
+/**
+ * Mark a record as superseded by writing supersededBy into its frontmatter, preserving
+ * the body and every other frontmatter field. Updates the catalog entry in place.
+ */
+export function markRecordSuperseded(memoryDir: string, pathOrId: string, byId: string): { id: string; path: string } {
+  const normalizedBy = normalizeMemoryId(byId);
+  const filePath = resolveMemoryFile(memoryDir, pathOrId);
+  const memory = readMemoryFile(filePath);
+  if (!memory?.frontmatter.id) throw new Error(`Memory record not found: ${pathOrId}`);
+  if (memory.frontmatter.id === normalizedBy) throw new Error(`A record cannot supersede itself: ${pathOrId}`);
+  writeMemoryFile(filePath, memory.content, { ...memory.frontmatter, supersededBy: normalizedBy });
+  upsertMemoryCatalog(memoryDir, filePath);
+  return { id: memory.frontmatter.id, path: path.relative(memoryDir, filePath) };
+}
+
+/**
+ * Remove supersededBy markers pointing at a deleted id so the former superseders are
+ * resurrected (natural undo). Returns the ids whose markers were cleared.
+ */
+export function clearSupersededMarkers(memoryDir: string, byId: string): string[] {
+  const normalized = normalizeMemoryId(byId);
+  const cleared: string[] = [];
+  for (const filePath of listMemoryFiles(memoryDir)) {
+    const memory = readMemoryFile(filePath);
+    if (!memory?.frontmatter.supersededBy || memory.frontmatter.supersededBy !== normalized) continue;
+    const frontmatter = { ...memory.frontmatter };
+    delete frontmatter.supersededBy;
+    writeMemoryFile(filePath, memory.content, frontmatter);
+    upsertMemoryCatalog(memoryDir, filePath);
+    if (memory.frontmatter.id) cleared.push(memory.frontmatter.id);
+  }
+  return cleared;
+}
+
+/**
+ * Pre-commit lifecycle guards (checked before any file write).
+ */
+
+/** Matches dated IDs like 20260725, 2026-07-25, or the -20260725 / -2026-07-25 suffix forms. */
+export function isDatedMemoryId(id: string): boolean {
+  return /(?:^|[.-])(?:\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])|\d{4}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01]))(?=$|[.-])/.test(
+    normalizeMemoryId(id),
+  );
+}
+
+/** Version-ish iteration suffixes: -v2, -v3, -final, -new, -latest, -done, or a date suffix. */
+function isIdFamilySuffix(suffix: string): boolean {
+  return (
+    /^-(?:v\d+|final|new|latest|done)(?:$|[-.])/.test(suffix) ||
+    /^-\d{4}-?(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])(?:$|[-.])/.test(suffix)
+  );
+}
+
+/**
+ * Deterministic ID-family auto-route: newId = oldId + version-ish suffix, same kind, and the
+ * old record is not superseded. The longest matching prefix wins so the most specific family
+ * member is overwritten. Returns the record to route to, or null.
+ */
+export function findIdFamilyRoute(memoryDir: string, newId: string): { id: string; filePath: string } | null {
+  const entries = filterSupersededEntries(memoryDir, getMemoryCatalog(memoryDir));
+  let best: MemoryCatalogEntry | null = null;
+  for (const entry of entries) {
+    if (entry.kind !== "state") continue;
+    if (!newId.startsWith(`${entry.id}-`)) continue;
+    if (!isIdFamilySuffix(newId.slice(entry.id.length))) continue;
+    if (!best || entry.id.length > best.id.length) best = entry;
+  }
+  if (!best) return null;
+  return { id: best.id, filePath: path.join(memoryDir, best.path) };
+}
+
+/**
+ * Concept-containment duplicate: same kind, both concept sets non-empty, and one set is a
+ * subset of the other. Returns the single best candidate (largest shared overlap, then newest)
+ * or null. Used to REJECT the write with a hint, never to auto-route.
+ */
+export function findConceptContainmentDuplicate(
+  memoryDir: string,
+  kind: MemoryKind,
+  newConcepts: string[],
+): { id: string; path: string; concepts: string[] } | null {
+  const normalized = uniqueSorted(newConcepts.map((concept) => normalizeConceptLabel(concept)).filter(Boolean));
+  if (normalized.length === 0) return null;
+  const entries = filterSupersededEntries(memoryDir, getMemoryCatalog(memoryDir));
+  let best: { entry: MemoryCatalogEntry; overlap: number } | null = null;
+  for (const entry of entries) {
+    if (entry.kind !== kind) continue;
+    const old = uniqueSorted(entry.concepts.map((concept) => normalizeConceptLabel(concept)).filter(Boolean));
+    if (old.length === 0) continue;
+    const isSubset = normalized.every((concept) => old.includes(concept));
+    const isSuperset = old.every((concept) => normalized.includes(concept));
+    if (!isSubset && !isSuperset) continue;
+    const overlap = normalized.filter((concept) => old.includes(concept)).length;
+    if (!best || overlap > best.overlap || (overlap === best.overlap && entry.mtimeMs > best.entry.mtimeMs)) {
+      best = { entry, overlap };
+    }
+  }
+  if (!best) return null;
+  return { id: best.entry.id, path: best.entry.path, concepts: best.entry.concepts };
+}
+
+/**
+ * Compact discovery: group records by (kind, canonical concept) and report clusters of at
+ * least minSize records as candidates for memory_compact. Read-only; superseded records are
+ * already being phased out so they are excluded.
+ */
+export interface CompactClusterReport {
+  kind: MemoryKind;
+  concept: string;
+  ids: string[];
+}
+
+export function findCompactClusters(memoryDir: string, minSize = 4): CompactClusterReport[] {
+  const entries = filterSupersededEntries(memoryDir, getMemoryCatalog(memoryDir));
+  const byConcept = new Map<string, Map<MemoryKind, string[]>>();
+  for (const entry of entries) {
+    for (const concept of entry.concepts) {
+      const normalized = normalizeConceptLabel(concept);
+      if (!normalized) continue;
+      let kinds = byConcept.get(normalized);
+      if (!kinds) {
+        kinds = new Map();
+        byConcept.set(normalized, kinds);
+      }
+      const ids = kinds.get(entry.kind) ?? [];
+      ids.push(entry.id);
+      kinds.set(entry.kind, ids);
+    }
+  }
+  const clusters: CompactClusterReport[] = [];
+  for (const [concept, kinds] of byConcept) {
+    for (const [kind, ids] of kinds) {
+      if (ids.length < minSize) continue;
+      clusters.push({ kind, concept, ids: uniqueSorted(ids) });
+    }
+  }
+  return clusters.sort(
+    (a, b) => b.ids.length - a.ids.length || a.concept.localeCompare(b.concept) || a.kind.localeCompare(b.kind),
+  );
 }
 
 function memoryFromCatalogEntry(memoryDir: string, entry: MemoryCatalogEntry) {
@@ -1525,14 +1688,22 @@ export function reconcileConceptDictionary(memoryDir: string, removableConcepts:
 export function deleteMemoryFile(
   memoryDir: string,
   pathOrId: string,
-): { id: string; path: string; dictionary: ConceptDictionary } {
+): { id: string; path: string; dictionary: ConceptDictionary; unhidden: string[] } {
   const filePath = resolveMemoryFile(memoryDir, pathOrId);
   const memory = readMemoryFile(filePath);
   if (!memory?.frontmatter.id || !memory.frontmatter.kind) throw new Error(`Memory file not found: ${pathOrId}`);
   fs.rmSync(filePath, { force: true });
   removeMemoryCatalogEntry(memoryDir, filePath);
+  // Reconcile: any record pointing at the deleted id is resurrected (natural undo of
+  // supersedes) by clearing its marker.
+  const unhidden = clearSupersededMarkers(memoryDir, memory.frontmatter.id);
   const dictionary = reconcileConceptDictionary(memoryDir, memory.frontmatter.concepts ?? []);
-  return { id: memory.frontmatter.id, path: path.relative(memoryDir, filePath), dictionary };
+  return {
+    id: memory.frontmatter.id,
+    path: path.relative(memoryDir, filePath),
+    dictionary,
+    unhidden,
+  };
 }
 /**
  * Memory context
@@ -1590,7 +1761,7 @@ export function buildMemoryContext(settings: MemoryMdSettings, cwd: string): str
   const memoryDir = getMemoryDir(settings, cwd);
   if (!fs.existsSync(memoryDir)) return "";
 
-  const candidates = getMemoryCatalog(memoryDir)
+  const candidates = filterSupersededEntries(memoryDir, getMemoryCatalog(memoryDir))
     .filter((entry) => !entry.sensitive)
     .sort(
       (a, b) =>

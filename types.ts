@@ -59,6 +59,7 @@ export interface MemoryFrontmatter {
   tags?: string[];
   created?: string;
   updated?: string;
+  supersededBy?: string;
 }
 
 export interface MemoryFile {

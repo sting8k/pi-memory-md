@@ -52,6 +52,8 @@ Each Git workspace gets an isolated project directory derived from its Git root 
 | `memory_search` | Search content or metadata, optionally by kind |
 | `memory_alias` | Add an alias for an existing canonical concept |
 | `memory_delete` | Explicitly delete one memory record and reconcile derived metadata |
+| `memory_check` | Inspect the folder structure and discover compact clusters |
+| `memory_compact` | Write a distilled state record and supersede an explicit list of records |
 | `memory_init` | Initialize identity-addressed `records/` |
 | `memory_migrate` | Rename a project or migrate a legacy project layout |
 
@@ -123,6 +125,45 @@ Project memory keeps concept vocabulary simple and transparent:
 `memory_write` normalizes concept spelling, resolves aliases, deduplicates concepts, and registers new concepts automatically. `memory_search({ searchIn: "concepts" })` is alias-aware and exact: unknown concept queries normalize to canonical labels and return no results when absent instead of falling back to broad token matching. The tool does not silently merge ambiguous semantic near-duplicates; it only returns advisory duplicate hints in tool details. `memory_alias({ alias, canonical })` makes duplicate hints actionable by registering an alias for an existing canonical concept; a standalone concept can be converted into an alias without rewriting existing records, and records stored under the old name stay findable through both the alias and the canonical (query-side alias-family expansion).
 
 Memory writes store ISO `created`/`updated` timestamps so same-day records can still sort by write time. Explicit `memory_delete` removes one record, updates `.catalog.json`, and reconciles `.concepts.json` by preserving aliases and active alias targets while only considering the deleted record's concepts for cleanup.
+
+## Lifecycle: supersedes, dedup, and compaction
+
+### Dated state IDs are refused
+
+`memory_write` refuses `state` records whose ID embeds a date (`20260725`, `2026-07-25`, or a `-20260725`-style suffix): dates belong to append-only events. The error suggests `kind:'event'`, or `forceCreate: true` to write the dated state ID anyway. Event IDs may carry dates normally.
+
+### Supersedes: derived hiding, no persisted hidden flag
+
+`memory_write` accepts `supersedes: ["@old-a", "@old-b"]`. After the new record is written, each old record's frontmatter gets `supersededBy: "<new-id>"` and its catalog entry is updated. Hiding is DERIVED at read time: a record is hidden only while its `supersededBy` target still exists. Nothing beyond the marker on the old record is persisted.
+
+- Chains resolve naturally: if `@c` is superseded by `@b` and `@b` by `@a`, both `@b` and `@c` are hidden while `@a` exists. Deleting `@a` resurrects `@b` (its superseder is gone) while `@c` stays hidden (its superseder `@b` still lives).
+- `memory_delete` also clears `supersededBy` markers that point at the deleted record, so resurrection is explicit on disk too.
+- `memory_list` hides superseded records by default; pass `includeSuperseded: true` to see them (marked `(superseded by @id)`).
+- `memory_read` reads a hidden record normally and appends a `Note: superseded by @id` line when the superseder still exists.
+- `memory_write` validates every `supersedes` reference before writing anything, and refuses self-supersede.
+
+### Pre-commit dedup for state only
+
+Events are append-only and never deduped. For `state` creates (target ID not yet existing), `memory_write` runs two checks before any file write, both bypassed by `forceCreate: true`:
+
+1. **Deterministic ID-family**: when the new ID equals an existing non-superseded state ID plus a version-ish suffix (`-v2`, `-v3`, `-final`, `-new`, `-latest`, `-done`, or a date suffix), the write is routed to an overwrite of the existing record, the diff is shown, and the response says `routed to overwrite @old (ID-family match)`. The longest matching prefix wins.
+2. **Concept containment**: when the new concept set and an existing non-superseded state record's set satisfy one-contains-the-other (both non-empty), the write is REJECTED with a single hint naming the similar record, its path, and `forceCreate: true`. Fuzzy similarity, Jaccard, or description matching are deliberately not used: auto-routing a fuzzy match risks silently overwriting the wrong record.
+
+### memory_compact: explicit distill + ordered markers
+
+`memory_compact({ path, description, ..., supersede: ["@a", "@b", ...] })` is the manual compaction path: the agent supplies the distilled content and the EXPLICIT list of IDs to absorb; nothing is auto-matched by concept.
+
+The tool writes in a safe order: the distilled `state` record is written FIRST, then each `supersede` target is marked `supersededBy` (and its catalog entry updated). If a later step fails, the state already exists and only some markers are missing — harmless duplication, never lost information. On a mid-way failure it performs a best-effort restore (delete the fresh distill, clear already-applied markers) and says so honestly; this is not an all-or-nothing guarantee.
+
+Validation happens before any file is touched: every `supersede` ID must exist or the whole call fails. A target that is already superseded is skipped and reported in the response. The response lists the IDs actually superseded so the agent sees what was absorbed.
+
+### Discovery in memory_check
+
+`memory_check` scans the catalog and reports same-kind record clusters that share at least one canonical concept with 4+ members, as candidates for `memory_compact`, including a ready-to-copy sample call. It is read-only; superseded records are excluded because they are already being phased out.
+
+### Catalog rebuilds from frontmatter
+
+The catalog is derived and rebuildable: `rebuildMemoryCatalog` reconstructs every entry — including `supersededBy` — from the files' frontmatter. Legacy records without `supersededBy` behave exactly as before; no migration is required.
 
 ## Legacy migration
 

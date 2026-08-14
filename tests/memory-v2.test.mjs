@@ -25,6 +25,7 @@ import {
   normalizeMemoryConcepts,
   parseMemoryFacts,
   readMemoryFile,
+  rebuildMemoryCatalog,
   resolveMemoryPath,
   resolveMemoryWriteTarget,
   syncRepository,
@@ -35,7 +36,11 @@ import {
 import { searchMemoryFiles } from "../.test-dist/search-engine.js";
 import {
   registerMemoryAlias,
+  registerMemoryCheck,
+  registerMemoryCompact,
   registerMemoryDelete,
+  registerMemoryList,
+  registerMemoryRead,
   registerMemorySearch,
   registerMemoryWrite,
 } from "../.test-dist/tools.js";
@@ -894,7 +899,7 @@ test("context rebuilds old catalogs before filtering sensitive memories", () => 
     const context = buildMemoryContext(settings, workspace);
     assert.match(context, /Public context/);
     assert.doesNotMatch(context, /Secret token path/);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(memoryDir, ".catalog.json"), "utf-8")).version, 4);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(memoryDir, ".catalog.json"), "utf-8")).version, 5);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -1367,6 +1372,521 @@ test("memory_write surfaces hygiene warnings for blocked concepts in response te
     assert.match(result.content[0].text, /looks like a date/);
     assert.deepEqual(result.details.frontmatter.concepts, ["ok-concept"]);
     assert.ok(result.details.warnings.some((warning) => /looks like a hash/.test(warning)));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ============================================================================
+// Round 2: dated-ID block, supersedes, pre-commit dedup, memory_compact, discovery
+// ============================================================================
+
+function toolSignal() {
+  return new AbortController().signal;
+}
+
+test("memory_write rejects dated state IDs unless forceCreate bypasses", async () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const { pi, tools } = fakePi();
+    registerMemoryWrite(pi, settings);
+    const signal = toolSignal();
+    const cwd = { cwd: workspace };
+    const base = { description: "Deploy run", summary: "Dated write must be blocked", claims: ["run"] };
+
+    const rejected = await tools
+      .get("memory_write")
+      .execute("w1", { path: "state/deploy-20260725.md", kind: "state", ...base }, signal, () => {}, cwd);
+    assert.match(rejected.content[0].text, /dated event ID/);
+    assert.match(rejected.content[0].text, /kind:'event'/);
+    assert.match(rejected.content[0].text, /forceCreate:true/);
+
+    const rejectedDashed = await tools
+      .get("memory_write")
+      .execute("w2", { path: "state/deploy-2026-07-25.md", kind: "state", ...base }, signal, () => {}, cwd);
+    assert.match(rejectedDashed.content[0].text, /dated event ID/);
+
+    // year-only IDs are not dated and pass
+    const yearOnly = await tools
+      .get("memory_write")
+      .execute(
+        "w3",
+        { path: "state/plan-2026.md", kind: "state", description: "Year plan", claims: ["y"] },
+        signal,
+        () => {},
+        cwd,
+      );
+    assert.match(yearOnly.content[0].text, /Memory file written/);
+
+    // event IDs may carry dates (append-only lifecycle is event)
+    const eventWrite = await tools
+      .get("memory_write")
+      .execute(
+        "w4",
+        { path: "events/deploy-20260725.md", kind: "event", description: "Dated event", claims: ["e"] },
+        signal,
+        () => {},
+        cwd,
+      );
+    assert.match(eventWrite.content[0].text, /Memory file written/);
+
+    // forceCreate bypasses the block
+    const forced = await tools
+      .get("memory_write")
+      .execute(
+        "w5",
+        { path: "state/deploy-20260725.md", kind: "state", forceCreate: true, ...base },
+        signal,
+        () => {},
+        cwd,
+      );
+    assert.match(forced.content[0].text, /Memory file written/);
+    assert.equal(forced.details.frontmatter.id, "state.deploy-20260725");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("supersedes hides old records, survives rebuild, and resurrects on delete", async () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const { pi, tools } = fakePi();
+    registerMemoryWrite(pi, settings);
+    registerMemoryList(pi, settings);
+    registerMemoryRead(pi, settings);
+    registerMemoryDelete(pi, settings);
+    const signal = toolSignal();
+    const cwd = { cwd: workspace };
+    const memoryDir = getMemoryDir(settings, workspace);
+
+    await tools
+      .get("memory_write")
+      .execute(
+        "w-c",
+        { path: "events/c.md", kind: "event", description: "Record C", claims: ["c"] },
+        signal,
+        () => {},
+        cwd,
+      );
+    const writeB = await tools.get("memory_write").execute(
+      "w-b",
+      {
+        path: "events/b.md",
+        kind: "event",
+        description: "Record B",
+        claims: ["b"],
+        supersedes: ["@event.c"],
+      },
+      signal,
+      () => {},
+      cwd,
+    );
+    assert.match(writeB.content[0].text, /Superseded: @event\.c/);
+    assert.deepEqual(writeB.details.superseded, ["event.c"]);
+
+    // marker persisted on the old record's frontmatter + catalog
+    const cPath = findMemoryFileById(memoryDir, "@event.c");
+    assert.equal(readMemoryFile(cPath).frontmatter.supersededBy, "event.b");
+    assert.equal(getMemoryCatalog(memoryDir).find((entry) => entry.id === "event.c").supersededBy, "event.b");
+
+    // rebuild keeps the marker (catalog is derived from frontmatter)
+    rebuildMemoryCatalog(memoryDir);
+    assert.equal(getMemoryCatalog(memoryDir).find((entry) => entry.id === "event.c").supersededBy, "event.b");
+
+    // list hides by default, shows with includeSuperseded
+    const listDefault = await tools.get("memory_list").execute("l1", {}, signal, () => {}, cwd);
+    assert.ok(!listDefault.content[0].text.includes("@event.c"));
+    const listAll = await tools.get("memory_list").execute("l2", { includeSuperseded: true }, signal, () => {}, cwd);
+    assert.match(listAll.content[0].text, /@event\.c[^\n]*\(superseded by @event\.b\)/);
+
+    // read by id still works and notes the superseder
+    const readC = await tools.get("memory_read").execute("r1", { path: "@event.c" }, signal, () => {}, cwd);
+    assert.match(readC.content[0].text, /Record C/);
+    assert.match(readC.content[0].text, /Note: superseded by @event\.b/);
+
+    // injection excludes the hidden record
+    assert.ok(!buildMemoryContext(settings, workspace).includes("event.c"));
+
+    // transitive chain: A supersedes B -> both B and C hidden
+    await tools.get("memory_write").execute(
+      "w-a",
+      {
+        path: "events/a.md",
+        kind: "event",
+        description: "Record A",
+        claims: ["a"],
+        supersedes: ["@event.b"],
+      },
+      signal,
+      () => {},
+      cwd,
+    );
+    const contextAfterA = buildMemoryContext(settings, workspace);
+    assert.ok(!contextAfterA.includes("event.b"));
+    assert.ok(!contextAfterA.includes("event.c"));
+
+    // delete A -> B resurrected (marker cleared), C stays hidden (its superseder B lives)
+    await tools.get("memory_delete").execute("d1", { path: "@event.a" }, signal, () => {}, cwd);
+    const contextAfterDelete = buildMemoryContext(settings, workspace);
+    assert.ok(contextAfterDelete.includes("event.b"));
+    assert.ok(!contextAfterDelete.includes("event.c"));
+    const bPath = findMemoryFileById(memoryDir, "@event.b");
+    assert.equal(readMemoryFile(bPath).frontmatter.supersededBy, undefined);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("pre-commit dedup: ID-family auto-route and concept-containment reject for state", async () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const { pi, tools } = fakePi();
+    registerMemoryWrite(pi, settings);
+    const signal = toolSignal();
+    const cwd = { cwd: workspace };
+    const memoryDir = getMemoryDir(settings, workspace);
+
+    await tools
+      .get("memory_write")
+      .execute(
+        "w1",
+        { path: "state/base.md", kind: "state", description: "Base config", concepts: ["alpha"], claims: ["base"] },
+        signal,
+        () => {},
+        cwd,
+      );
+
+    // ID-family: state.base-v2 routes to overwrite @state.base
+    const routed = await tools
+      .get("memory_write")
+      .execute(
+        "w2",
+        { path: "state/base-v2.md", kind: "state", description: "Base config v2", concepts: ["alpha"], claims: ["v2"] },
+        signal,
+        () => {},
+        cwd,
+      );
+    assert.match(routed.content[0].text, /routed to overwrite/);
+    assert.match(routed.content[0].text, /@state\.base/);
+    assert.match(routed.content[0].text, /ID-family match/);
+    assert.equal(routed.details.operation, "overwrite");
+    assert.equal(routed.details.frontmatter.id, "state.base");
+    const states = getMemoryCatalog(memoryDir).filter((entry) => entry.kind === "state");
+    assert.equal(states.length, 1);
+    assert.equal(states[0].id, "state.base");
+
+    // version suffix without an existing base is a fresh record, not a route
+    const fresh = await tools.get("memory_write").execute(
+      "w3",
+      {
+        path: "state/only-v2.md",
+        kind: "state",
+        description: "Fresh versioned record",
+        concepts: ["beta"],
+        claims: ["x"],
+      },
+      signal,
+      () => {},
+      cwd,
+    );
+    assert.match(fresh.content[0].text, /Memory file written/);
+    assert.equal(fresh.details.frontmatter.id, "state.only-v2");
+
+    // concept containment: new set is a superset of an existing record's set -> reject with hint
+    await tools.get("memory_write").execute(
+      "w4",
+      {
+        path: "state/report.md",
+        kind: "state",
+        description: "Deploy report",
+        concepts: ["deployment", "rollback"],
+        claims: ["report"],
+      },
+      signal,
+      () => {},
+      cwd,
+    );
+    const rejected = await tools.get("memory_write").execute(
+      "w5",
+      {
+        path: "state/report-summary.md",
+        kind: "state",
+        description: "Deploy report summary",
+        concepts: ["deployment", "rollback", "incident"],
+        claims: ["summary"],
+      },
+      signal,
+      () => {},
+      cwd,
+    );
+    assert.match(rejected.content[0].text, /Similar state record @state\.report/);
+    assert.match(rejected.content[0].text, /forceCreate:true/);
+    assert.ok(!fs.existsSync(path.join(memoryDir, "records", "state.report-summary.md")));
+
+    // forceCreate bypasses the containment reject
+    const forced = await tools.get("memory_write").execute(
+      "w6",
+      {
+        path: "state/report-summary.md",
+        kind: "state",
+        forceCreate: true,
+        description: "Deploy report summary",
+        concepts: ["deployment", "rollback", "incident"],
+        claims: ["summary"],
+      },
+      signal,
+      () => {},
+      cwd,
+    );
+    assert.match(forced.content[0].text, /Memory file written/);
+
+    // events are append-only and never deduped
+    await tools
+      .get("memory_write")
+      .execute(
+        "w7",
+        { path: "events/e1.md", kind: "event", description: "E1", concepts: ["deployment"], claims: ["x"] },
+        signal,
+        () => {},
+        cwd,
+      );
+    const eventCreate = await tools
+      .get("memory_write")
+      .execute(
+        "w8",
+        { path: "events/e2.md", kind: "event", description: "E2", concepts: ["deployment"], claims: ["y"] },
+        signal,
+        () => {},
+        cwd,
+      );
+    assert.match(eventCreate.content[0].text, /Memory file written/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("memory_compact writes the distill, supersedes targets, and skips already-superseded ids", async () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const { pi, tools } = fakePi();
+    registerMemoryWrite(pi, settings);
+    registerMemoryCompact(pi, settings);
+    registerMemoryList(pi, settings);
+    const signal = toolSignal();
+    const cwd = { cwd: workspace };
+    const memoryDir = getMemoryDir(settings, workspace);
+
+    for (const name of ["e1", "e2", "e3"]) {
+      await tools
+        .get("memory_write")
+        .execute(
+          `w-${name}`,
+          { path: `events/${name}.md`, kind: "event", description: `Event ${name}`, claims: [`${name} detail`] },
+          signal,
+          () => {},
+          cwd,
+        );
+    }
+    await tools
+      .get("memory_write")
+      .execute(
+        "w-e0",
+        { path: "events/e0.md", kind: "event", description: "Event e0", claims: ["e0 detail"] },
+        signal,
+        () => {},
+        cwd,
+      );
+    await tools.get("memory_write").execute(
+      "w-super",
+      {
+        path: "events/super.md",
+        kind: "event",
+        description: "Superseding event",
+        claims: ["super"],
+        supersedes: ["@event.e0"],
+      },
+      signal,
+      () => {},
+      cwd,
+    );
+
+    const result = await tools.get("memory_compact").execute(
+      "c1",
+      {
+        path: "state/incidents.md",
+        description: "Incident lifecycle summary",
+        summary: "Distilled from four events",
+        claims: ["distilled"],
+        supersede: ["@event.e0", "@event.e1", "@event.e2", "@event.e3"],
+      },
+      signal,
+      () => {},
+      cwd,
+    );
+    assert.match(result.content[0].text, /Memory compact written: records\/state\.incidents\.md \(@state\.incidents\)/);
+    assert.match(result.content[0].text, /Superseded: @event\.e1, @event\.e2, @event\.e3/);
+    assert.match(result.content[0].text, /Skipped: @event\.e0 \(already superseded by @event\.super\)/);
+    assert.deepEqual(result.details.superseded, ["event.e1", "event.e2", "event.e3"]);
+    assert.deepEqual(result.details.skipped, [{ id: "event.e0", reason: "already superseded by @event.super" }]);
+
+    // distill exists first; marked records carry supersededBy pointing at it
+    assert.ok(fs.existsSync(path.join(memoryDir, "records", "state.incidents.md")));
+    for (const id of ["event.e1", "event.e2", "event.e3"]) {
+      const memory = readMemoryFile(findMemoryFileById(memoryDir, `@${id}`));
+      assert.equal(memory.frontmatter.supersededBy, "state.incidents");
+    }
+
+    // hidden from list and injection
+    const listDefault = await tools.get("memory_list").execute("l1", {}, signal, () => {}, cwd);
+    assert.ok(!listDefault.content[0].text.includes("@event.e1"));
+    const context = buildMemoryContext(settings, workspace);
+    assert.ok(context.includes("state.incidents"));
+    assert.ok(!context.includes("event.e1"));
+
+    // validation: a missing supersede id aborts before anything is written
+    const bad = await tools
+      .get("memory_compact")
+      .execute(
+        "c2",
+        { path: "state/bad.md", description: "Bad compact", supersede: ["@event.nope"] },
+        signal,
+        () => {},
+        cwd,
+      );
+    assert.match(bad.content[0].text, /Memory ID not found: @event\.nope/);
+    assert.ok(!fs.existsSync(path.join(memoryDir, "records", "state.bad.md")));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("memory_check reports compact clusters for same-kind concept groups", async () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const { pi, tools } = fakePi();
+    registerMemoryWrite(pi, settings);
+    registerMemoryCheck(pi, settings);
+    const signal = toolSignal();
+    const cwd = { cwd: workspace };
+    const extras = ["login", "session", "refresh", "logout"];
+    for (const extra of extras) {
+      await tools.get("memory_write").execute(
+        `w-${extra}`,
+        {
+          path: `state/auth-${extra}.md`,
+          kind: "state",
+          description: `Auth ${extra}`,
+          concepts: ["auth-flow", extra],
+          claims: [extra],
+        },
+        signal,
+        () => {},
+        cwd,
+      );
+    }
+    const result = await tools.get("memory_check").execute("check", {}, signal, () => {}, cwd);
+    assert.match(result.content[0].text, /4 state records share concept "auth-flow", candidates for memory_compact/);
+    assert.match(result.content[0].text, /@state\.auth-login/);
+    assert.match(result.content[0].text, /memory_compact/);
+    assert.equal(result.details.clusters.length, 1);
+    assert.equal(result.details.clusters[0].kind, "state");
+    assert.equal(result.details.clusters[0].concept, "auth-flow");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("rebuildMemoryCatalog reconstructs supersededBy from frontmatter", async () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const memoryDir = getMemoryDir(settings, workspace);
+    const pathA = path.join(memoryDir, "records", "state.a.md");
+    const pathB = path.join(memoryDir, "records", "state.b.md");
+    writeMemoryFile(pathA, "# A", {
+      id: "state.a",
+      kind: "state",
+      description: "A",
+      created: "2026-01-01",
+      updated: "2026-01-01",
+    });
+    writeMemoryFile(pathB, "# B", {
+      id: "state.b",
+      kind: "state",
+      description: "B",
+      created: "2026-01-02",
+      updated: "2026-01-02",
+      supersededBy: "state.a",
+    });
+    upsertMemoryCatalog(memoryDir, pathA);
+    upsertMemoryCatalog(memoryDir, pathB);
+    const rebuilt = rebuildMemoryCatalog(memoryDir);
+    assert.equal(rebuilt.find((entry) => entry.id === "state.b").supersededBy, "state.a");
+    assert.equal(rebuilt.find((entry) => entry.id === "state.a").supersededBy, undefined);
+    assert.equal(getMemoryCatalog(memoryDir).find((entry) => entry.id === "state.b").supersededBy, "state.a");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("memory_compact rollback restores a pre-existing distill target when marking fails", async () => {
+  const { root, workspace, settings } = fixture();
+  try {
+    const { pi, tools } = fakePi();
+    registerMemoryWrite(pi, settings);
+    registerMemoryCompact(pi, settings);
+    const signal = toolSignal();
+    const cwd = { cwd: workspace };
+    const memoryDir = getMemoryDir(settings, workspace);
+
+    // Pre-existing distill target with known content
+    await tools
+      .get("memory_write")
+      .execute(
+        "w1",
+        { path: "state/benchmark.md", kind: "state", description: "Benchmark conclusions v1", claims: ["v1 content"] },
+        signal,
+        () => {},
+        cwd,
+      );
+    const distillPath = path.join(memoryDir, "records", "state.benchmark.md");
+    const beforeRaw = fs.readFileSync(distillPath, "utf-8");
+
+    // Supersede target that will fail during the mark step (read-only file -> EACCES)
+    await tools
+      .get("memory_write")
+      .execute(
+        "w2",
+        { path: "events/old.md", kind: "event", description: "Old event", claims: ["old"] },
+        signal,
+        () => {},
+        cwd,
+      );
+    const oldPath = path.join(memoryDir, "records", "event.old.md");
+    fs.chmodSync(oldPath, 0o444);
+
+    const result = await tools.get("memory_compact").execute(
+      "c1",
+      {
+        path: "state/benchmark.md",
+        description: "Benchmark conclusions v2",
+        claims: ["v2 content"],
+        supersede: ["@event.old"],
+      },
+      signal,
+      () => {},
+      cwd,
+    );
+    assert.match(result.content[0].text, /rolled back best-effort/);
+
+    // The pre-existing distill target is restored byte-for-byte, not deleted
+    assert.equal(fs.readFileSync(distillPath, "utf-8"), beforeRaw);
+    // The failed target was never marked
+    assert.equal(readMemoryFile(oldPath).frontmatter.supersededBy, undefined);
+    // Catalog is consistent with the restored file
+    assert.equal(
+      getMemoryCatalog(memoryDir).find((entry) => entry.id === "state.benchmark").description,
+      "Benchmark conclusions v1",
+    );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

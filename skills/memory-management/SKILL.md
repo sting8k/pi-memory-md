@@ -108,11 +108,32 @@ Managed fields are:
 - `claims`: decisions or conclusions;
 - `tags`: optional labels;
 - `created`: creation timestamp;
-- `updated`: timestamp for the last meaningful update.
+- `updated`: timestamp for the last meaningful update;
+- `supersededBy`: stable `@id` of the record that replaced this one (written by the tool, used for derived hiding).
 
 ## Cleanup
 
 Use `memory_delete({ path: "@event.foo" })` only for explicit destructive cleanup.
+
+## Anti-fragmentation: supersede, dedup, and compact
+
+Memory guards against stale snapshots and concept-dusted duplicates:
+
+- **Dated `state` IDs are refused.** Dates belong to events. `memory_write` rejects IDs like `state.deploy-20260725` or `state.deploy-2026-07-25` and asks for `kind:'event'` or `forceCreate: true`.
+- **State writes are deduped before hitting disk.** For a new `state` ID, a version-suffix ID in the same family (`state.deploy-v2` with `state.deploy` present) auto-routes to an overwrite of the base record — the diff is shown, the response says `routed to overwrite`. A concept set that contains (or is contained by) an existing state record's set is rejected with a hint naming the similar record; rewrite to that path or pass `forceCreate: true`. Events are append-only and never deduped.
+- **Replace records instead of stacking lookalikes.** When updating canonical state, write to the existing path/ID. When you have several event reports covering one topic, distill them with `memory_compact` instead of deleting or leaving duplicates:
+
+```text
+memory_compact({
+  path: "state/incident-lifecycle.md",
+  description: "Incident lifecycle distilled from recent reports",
+  summary: "One sentence covering the distilled state",
+  claims: ["..."],
+  supersede: ["@event.incident-a", "@event.incident-b", "@event.incident-c"]
+})
+```
+
+`memory_compact` writes the distilled `state` record first, then marks each `supersede` ID as superseded; the response lists what it absorbed and any skipped ids (for example, already-superseded records). Superseded records stay on disk but drop out of injection and `memory_list`; `memory_list({ includeSuperseded: true })` shows them, and `memory_read` still reads them with a `superseded by @id` note. Deleting a superseding record resurrects the ones it hid. Use `memory_check` to discover clusters of 4+ same-kind records sharing a concept, which points to a ready-to-copy `memory_compact` call.
 
 ## Optional facts
 
