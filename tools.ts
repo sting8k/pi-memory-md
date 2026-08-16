@@ -731,6 +731,12 @@ function formatClusterWarnings(clusters: CompactClusterReport[]): string {
   return `\n\nCluster warnings (${clusters.length} cluster${clusters.length > 1 ? "s" : ""}):\n${sections.join("\n")}`;
 }
 
+// One label rule for both output modes: the supersede marker is shown only when the superseding
+// record still exists, which is the same condition that hides the record from default results.
+function supersededSuffix(memoryDir: string, supersededBy?: string): string {
+  return supersededBy && supersededByExists(memoryDir, supersededBy) ? ` (superseded by @${supersededBy})` : "";
+}
+
 function buildMemoryListResult(memoryDir: string, kind?: "state" | "event", includeSuperseded?: boolean) {
   const catalogEntries = getMemoryCatalog(memoryDir);
   const visibleEntries = includeSuperseded ? catalogEntries : filterSupersededEntries(memoryDir, catalogEntries);
@@ -746,7 +752,7 @@ function buildMemoryListResult(memoryDir: string, kind?: "state" | "event", incl
   const list = files
     .map(
       (entry) =>
-        `  - ${entry.path} (@${entry.id})${entry.supersededBy ? ` (superseded by @${entry.supersededBy})` : ""}\n    ${entry.kind}: ${entry.description ?? "No description"}`,
+        `  - ${entry.path} (@${entry.id})${supersededSuffix(memoryDir, entry.supersededBy)}\n    ${entry.kind}: ${entry.description ?? "No description"}`,
     )
     .join("\n");
   const clusters = findCompactClusters(memoryDir);
@@ -867,6 +873,7 @@ export function registerMemorySearch(pi: ExtensionAPI, settings: MemoryMdSetting
             path: h.path,
             id,
             kind: entry?.kind,
+            supersededBy: entry?.supersededBy,
             match: h.snippet,
             matchCount: h.matchCount,
             matchedIn: h.matchedIn,
@@ -882,7 +889,10 @@ export function registerMemorySearch(pi: ExtensionAPI, settings: MemoryMdSetting
                 results.length === 0
                   ? "No results found."
                   : `Found ${results.length} result(s):\n\n${results
-                      .map((r) => `  ${r.path} (@${r.id})\n  ${r.match}\n  Next: ${r.next}`)
+                      .map(
+                        (r) =>
+                          `  ${r.path} (@${r.id})${supersededSuffix(memoryDir, r.supersededBy)}\n  ${r.match}\n  Next: ${r.next}`,
+                      )
                       .join("\n\n")}`,
             },
           ],

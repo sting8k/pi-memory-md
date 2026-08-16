@@ -1429,6 +1429,14 @@ test("supersedes hides old records, survives rebuild, and resurrects on delete",
     const listAll = await tools.get("memory_search").execute("l2", { includeSuperseded: true }, signal, () => {}, cwd);
     assert.match(listAll.content[0].text, /@event\.c[^\n]*\(superseded by @event\.b\)/);
 
+    // search mode uses the same marker: superseded hit is labelled, live hit is not
+    const searchAll = await tools
+      .get("memory_search")
+      .execute("s1", { query: "Record", includeSuperseded: true }, signal, () => {}, cwd);
+    assert.match(searchAll.content[0].text, /@event\.c\) \(superseded by @event\.b\)/);
+    assert.match(searchAll.content[0].text, /@event\.b\)\n/);
+    assert.ok(!/@event\.b\) \(superseded by/.test(searchAll.content[0].text));
+
     // read by id still works and notes the superseder
     const readC = await tools.get("memory_read").execute("r1", { path: "@event.c" }, signal, () => {}, cwd);
     assert.match(readC.content[0].text, /Record C/);
