@@ -1,16 +1,6 @@
 import fs from "node:fs";
-import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import {
-  buildMemoryContext,
-  createDefaultFiles,
-  ensureDirectoryStructure,
-  getMemoryDir,
-  gitExec,
-  loadSettings,
-  type MemoryMdSettings,
-  syncRepository,
-} from "./memoryMdCore.js";
+import { buildMemoryContext, getMemoryDir, loadSettings, type MemoryMdSettings } from "./memoryMdCore.js";
 import { registerAllMemoryTools } from "./tools.js";
 
 /**
@@ -19,15 +9,10 @@ import { registerAllMemoryTools } from "./tools.js";
 
 export default function memoryMdExtension(pi: ExtensionAPI) {
   let settings: MemoryMdSettings = loadSettings();
-  const repoInitialized = { value: false };
-  let syncPromise: ReturnType<typeof syncRepository> | null = null;
   let cachedMemoryContext: string | null = null;
   let memoryInjected = false;
 
-  function initMemoryContext(
-    ctx: ExtensionContext,
-    options: { showNotification: boolean; autoSync: boolean },
-  ): boolean {
+  function initMemoryContext(ctx: ExtensionContext, options: { showNotification: boolean }): boolean {
     settings = loadSettings();
 
     if (!settings.enabled) return false;
@@ -36,18 +21,9 @@ export default function memoryMdExtension(pi: ExtensionAPI) {
 
     if (!fs.existsSync(memoryDir)) {
       if (options.showNotification) {
-        ctx.ui.notify("Memory-md not initialized. Use /memory-init to set up project memory.", "info");
+        ctx.ui.notify("Memory-md has no records yet. The first memory_write creates project memory.", "info");
       }
       return false;
-    }
-
-    if (options.autoSync && settings.autoSync?.onSessionStart && settings.localPath) {
-      syncPromise = syncRepository(pi, settings, repoInitialized).then((syncResult) => {
-        if (settings.repoUrl) {
-          ctx.ui.notify(syncResult.message, syncResult.success ? "info" : "error");
-        }
-        return syncResult;
-      });
     }
 
     cachedMemoryContext = buildMemoryContext(settings, ctx.cwd);
@@ -55,21 +31,11 @@ export default function memoryMdExtension(pi: ExtensionAPI) {
     return true;
   }
 
-  pi.on("session_start", async (event, ctx) => {
-    if (event.reason === "new" || event.reason === "fork") {
-      syncPromise = null;
-      initMemoryContext(ctx, { showNotification: true, autoSync: false });
-    } else {
-      initMemoryContext(ctx, { showNotification: true, autoSync: true });
-    }
+  pi.on("session_start", async (_event, ctx) => {
+    initMemoryContext(ctx, { showNotification: true });
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
-    if (syncPromise) {
-      await syncPromise;
-      syncPromise = null;
-    }
-
     const mode = settings.injection || "message-append";
 
     if (!cachedMemoryContext) return undefined;
@@ -101,52 +67,7 @@ export default function memoryMdExtension(pi: ExtensionAPI) {
     return undefined;
   });
 
-  registerAllMemoryTools(pi, settings, repoInitialized);
-
-  pi.registerCommand("memory-status", {
-    description: "Show memory repository status",
-    handler: async (_args, ctx) => {
-      const memoryDir = getMemoryDir(settings, ctx.cwd);
-      const projectName = path.basename(memoryDir);
-
-      if (!fs.existsSync(memoryDir)) {
-        ctx.ui.notify(`Memory: ${projectName} | Not initialized | Use /memory-init to set up`, "info");
-        return;
-      }
-
-      const result = await gitExec(pi, settings.localPath!, ["status", "--porcelain"]);
-      const isDirty = result.stdout.trim().length > 0;
-
-      ctx.ui.notify(
-        `Memory: ${projectName} | Repo: ${isDirty ? "Uncommitted changes" : "Clean"} | Path: ${memoryDir}`,
-        isDirty ? "warning" : "info",
-      );
-    },
-  });
-
-  pi.registerCommand("memory-init", {
-    description: "Initialize memory repository",
-    handler: async (_args, ctx) => {
-      const memoryDir = getMemoryDir(settings, ctx.cwd);
-      const alreadyInitialized = fs.existsSync(memoryDir);
-
-      const result = await syncRepository(pi, settings, repoInitialized);
-
-      if (!result.success) {
-        ctx.ui.notify(`Initialization failed: ${result.message}`, "error");
-        return;
-      }
-
-      ensureDirectoryStructure(memoryDir);
-      createDefaultFiles(memoryDir);
-
-      if (alreadyInitialized) {
-        ctx.ui.notify(`Memory already exists: ${result.message}`, "info");
-      } else {
-        ctx.ui.notify(`Memory initialized: ${result.message}\n\nCreated:\n  - records`, "info");
-      }
-    },
-  });
+  registerAllMemoryTools(pi, settings);
 
   pi.registerCommand("memory-refresh", {
     description: "Refresh memory context from files",

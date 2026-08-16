@@ -5,11 +5,10 @@ import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import {
-  addConceptAlias,
   buildStructuredMemoryContent,
-  createDefaultFiles,
+  type CompactClusterReport,
   deleteMemoryFile,
-  ensureDirectoryStructure,
+  ensureProjectMemoryInitialized,
   expandConceptSearchFamilies,
   filterSupersededEntries,
   findCompactClusters,
@@ -20,12 +19,9 @@ import {
   getCurrentDate,
   getMemoryCatalog,
   getMemoryDir,
-  gitExec,
   isDatedMemoryId,
-  listMemoryFiles,
   markRecordSuperseded,
   memoryFileFromCatalogEntry,
-  migrateMemoryProject,
   normalizeConceptSearchQuery,
   normalizeMemoryConcepts,
   readMemoryFile,
@@ -34,7 +30,6 @@ import {
   resolveMemoryPath,
   resolveMemoryWriteTarget,
   supersededByExists,
-  syncRepository,
   upsertMemoryCatalog,
   validateMemoryContent,
   writeMemoryFile,
@@ -286,30 +281,6 @@ function renderMemoryResult(
   );
 }
 
-function renderSyncResult(
-  result: { content: Array<{ type: string; text?: string }>; details?: unknown },
-  options: { expanded: boolean; isPartial: boolean },
-  theme: Theme,
-): Text {
-  if (options.isPartial) return renderText(theme.fg("warning", "Syncing..."));
-  const details = result.details as { success?: boolean; initialized?: boolean; timeout?: boolean } | undefined;
-  if (details?.initialized === false) return renderText(theme.fg("muted", "Not initialized"));
-  if (details?.timeout) return renderText(theme.fg("error", getResultText(result)));
-
-  const text = getResultText(result);
-  if (!options.expanded) {
-    const lines = text.split("\n");
-    if (details?.success === false) {
-      return renderText(theme.fg("error", lines[0] || "Operation failed") + buildExpandHint(lines.length, theme));
-    }
-    const summary = details?.success
-      ? theme.fg("success", lines[0] || "Success")
-      : theme.fg("success", lines[0] || "Status");
-    return renderText(summary + buildExpandHint(lines.length, theme));
-  }
-  return renderText(theme.fg("toolOutput", text));
-}
-
 function renderCountResult(
   result: { content: Array<{ type: string; text?: string }>; details?: unknown },
   options: { expanded: boolean; isPartial: boolean },
@@ -324,148 +295,6 @@ function renderCountResult(
       theme.fg("success", `${details?.count ?? 0} ${label}`) + buildExpandHint(text.split("\n").length, theme),
     );
   return renderText(theme.fg("toolOutput", text));
-}
-
-function formatLimitedList(items: string[], limit = 20): string[] {
-  const visible = items.slice(0, limit).map((item) => `  - ${item}`);
-  if (items.length > limit) visible.push(`  ...and ${items.length - limit} more`);
-  return visible;
-}
-
-function formatMigrationResult(result: ReturnType<typeof migrateMemoryProject>): string {
-  if (!result.success) {
-    const lines = [result.message];
-    if (result.conflicts.length > 0) lines.push("", "Conflicts:", ...formatLimitedList(result.conflicts));
-    if (result.candidates && result.candidates.length > 0) {
-      lines.push("", "Existing project folders:", ...formatLimitedList(result.candidates));
-    }
-    return lines.join("\n");
-  }
-
-  const lines = [
-    result.dryRun ? "Migration preview:" : "Migrated project memory:",
-    `  from: ${result.from}`,
-    `  to: ${result.to}`,
-    `  mode: ${result.mode}`,
-    `  files: ${result.files}`,
-  ];
-
-  lines.push(
-    "",
-    result.dryRun ? "No changes made." : 'Run memory_sync(action="push") to commit and push the migration.',
-  );
-  return lines.join("\n");
-}
-
-export function registerMemorySync(
-  pi: ExtensionAPI,
-  settings: MemoryMdSettings,
-  isRepoInitialized: { value: boolean },
-): void {
-  pi.registerTool({
-    name: "memory_sync",
-    label: "Memory Sync",
-    description: "Synchronize memory repository with git (pull/push/status)",
-    parameters: Type.Object({
-      action: Type.Union([Type.Literal("pull"), Type.Literal("push"), Type.Literal("status")], {
-        description: "Action to perform",
-      }),
-    }),
-
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const { action } = params as { action: "pull" | "push" | "status" };
-      const localPath = settings.localPath!;
-      const memoryDir = getMemoryDir(settings, ctx.cwd);
-      const recordsDir = path.join(memoryDir, "records");
-
-      if (action === "status") {
-        const initialized = isRepoInitialized.value && fs.existsSync(recordsDir);
-        if (!initialized) {
-          return {
-            content: [{ type: "text", text: "Memory repository not initialized. Use memory_init to set up." }],
-            details: { initialized: false },
-          };
-        }
-        const result = await gitExec(pi, localPath, ["status", "--porcelain"]);
-        if (!result.success) {
-          return {
-            content: [{ type: "text", text: `Git status failed: ${result.stdout || "Unknown error"}` }],
-            details: { success: false, error: result.stdout },
-          };
-        }
-        const dirty = result.stdout.trim().length > 0;
-        return {
-          content: [{ type: "text", text: dirty ? `Changes detected:\n${result.stdout}` : "No uncommitted changes" }],
-          details: { initialized: true, dirty },
-        };
-      }
-
-      if (action === "pull") {
-        const result = await syncRepository(pi, settings, isRepoInitialized);
-        return {
-          content: [{ type: "text", text: result.message }],
-          details: { success: result.success },
-        };
-      }
-
-      if (action === "push") {
-        const statusResult = await gitExec(pi, localPath, ["status", "--porcelain"]);
-        const hasChanges = statusResult.stdout.trim().length > 0;
-
-        if (hasChanges) {
-          await gitExec(pi, localPath, ["add", "."]);
-          const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-          const commitResult = await gitExec(pi, localPath, ["commit", "-m", `Update memory - ${timestamp}`]);
-          if (!commitResult.success) {
-            return {
-              content: [{ type: "text", text: commitResult.stdout || "Commit failed" }],
-              details: { success: false },
-            };
-          }
-        }
-
-        const result = await gitExec(pi, localPath, ["push"]);
-        if (result.timeout) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: "Unable to connect to GitHub repository, connection timeout (10s). Please check your network connection or try again later.",
-              },
-            ],
-            details: { success: false, timeout: true },
-          };
-        }
-
-        if (result.success) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: hasChanges
-                  ? "Committed and pushed changes to repository"
-                  : "No changes to commit, repository up to date",
-              },
-            ],
-            details: { success: true, committed: hasChanges },
-          };
-        }
-        return {
-          content: [{ type: "text", text: result.stdout || "Push failed" }],
-          details: { success: false },
-        };
-      }
-
-      return {
-        content: [{ type: "text", text: "Unknown action" }],
-        details: {},
-      };
-    },
-
-    renderCall: (args, theme) => new Text(buildToolCallText("memory_sync", args, theme), 0, 0),
-    renderResult: (result, options, theme) =>
-      options.isPartial ? renderText(theme.fg("warning", "Syncing...")) : renderSyncResult(result, options, theme),
-  });
 }
 
 export function registerMemoryRead(pi: ExtensionAPI, settings: MemoryMdSettings): void {
@@ -523,7 +352,9 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
     label: "Memory Write",
     description:
       "Create or replace a structured project memory record. Logical state/ and events/ paths are stored under records/<stable-id>.md. " +
-      "Prefer summary, concepts, claims, facts, relations, and optional notes over long prose.",
+      "Prefer summary, concepts, claims, facts, relations, and optional notes over long prose. " +
+      'To merge N records into one, write the distilled record with supersedes: ["@a", "@b", ...]; the new record is written first, then each listed record is marked superseded so it drops out of injection and listings. ' +
+      "The first write in a project creates the local memory structure automatically.",
     parameters: Type.Object({
       path: Type.String({
         description: "Relative .md path under logical state/ or events/, or records/<stable-id>.md",
@@ -548,11 +379,14 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
         }),
       ),
       forceCreate: Type.Optional(
-        Type.Boolean({ description: "Bypass the dated-ID block and pre-commit dedup checks and force a fresh record" }),
+        Type.Boolean({ description: "Bypass the dated-ID block and pre-write dedup checks and force a fresh record" }),
       ),
       supersedes: Type.Optional(
         Type.Array(
-          Type.String({ description: "Stable @id or path of records this write replaces; they are marked superseded" }),
+          Type.String({
+            description:
+              "Stable @id or path of records this write replaces; they are marked superseded. A non-empty list also skips the pre-write dedup checks.",
+          }),
         ),
       ),
     }),
@@ -586,6 +420,9 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
       const memoryDir = getMemoryDir(settings, ctx.cwd);
 
       try {
+        // Auto-init: the first write in a project creates records/ plus the default records.
+        const initialized = ensureProjectMemoryInitialized(memoryDir);
+
         const hasStructuredFields = Boolean(
           summary ||
             concepts?.length ||
@@ -640,17 +477,18 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
         let targetExists = fs.existsSync(target.filePath);
         let existingPath = targetExists ? target.filePath : legacyExists && legacyExisting ? legacyPath : null;
 
-        // Pre-commit lifecycle guard: dated state IDs are refused (they read as events).
+        // Pre-write lifecycle guard: dated state IDs are refused (they read as events).
         if (!forceCreate && target.kind === "state" && isDatedMemoryId(target.id)) {
           throw new Error(
             `Memory ID '@${target.id}' looks like a dated event ID. Events are append-only; write it with kind:'event', or pass forceCreate:true to use a dated state ID.`,
           );
         }
 
-        // Pre-commit dedup for state creates only (events are append-only and untouched):
+        // Pre-write dedup for state creates only (events are append-only and untouched):
         // deterministic ID-family routes to an overwrite; concept containment rejects with a hint.
+        // A non-empty supersedes list is itself the dedup decision, so it skips both checks.
         let routedTo: string | null = null;
-        if (!forceCreate && !targetExists && target.kind === "state") {
+        if (!forceCreate && !supersedes?.length && !targetExists && target.kind === "state") {
           const route = findIdFamilyRoute(memoryDir, target.id);
           if (route) {
             target = { filePath: route.filePath, id: route.id, kind: "state" };
@@ -671,15 +509,20 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
         const existing = targetExists ? readMemoryFile(target.filePath) : legacyExisting;
 
         // Validate supersede targets before any file is touched, so a bad reference never leaves
-        // a half-applied write behind.
-        const supersedeTargets: Array<{ filePath: string; id: string }> = [];
+        // a half-applied write behind. Already-superseded targets are skipped later (reported,
+        // not fatal).
+        const supersedeTargets: Array<{ filePath: string; id: string; supersededBy?: string }> = [];
         if (supersedes?.length) {
           for (const ref of supersedes) {
             const filePath = resolveMemoryFile(memoryDir, ref);
             const memory = readMemoryFile(filePath);
             if (!memory?.frontmatter.id) throw new Error(`Supersede target not found: ${ref}`);
             if (memory.frontmatter.id === target.id) throw new Error(`A record cannot supersede itself: ${ref}`);
-            supersedeTargets.push({ filePath, id: memory.frontmatter.id });
+            supersedeTargets.push({
+              filePath,
+              id: memory.frontmatter.id,
+              supersededBy: memory.frontmatter.supersededBy,
+            });
           }
         }
 
@@ -699,18 +542,65 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
         else delete frontmatter.sensitive;
         delete frontmatter.id;
         delete frontmatter.kind;
+        // An explicit write makes the record current again, so a supersede marker on it is cleared.
+        const clearedSuperseder =
+          frontmatter.supersededBy && supersededByExists(memoryDir, frontmatter.supersededBy)
+            ? frontmatter.supersededBy
+            : undefined;
+        delete frontmatter.supersededBy;
 
+        // Write-then-mark: the new record is written FIRST, so an interrupted run leaves the new
+        // record plus a few not-yet-hidden records (harmless duplication) instead of lost content.
         writeMemoryFile(target.filePath, memoryContent, frontmatter);
         const afterRaw = fs.readFileSync(target.filePath, "utf-8");
         const overwriteDiff = beforeRaw === undefined ? undefined : buildMemoryOverwriteDiff(beforeRaw, afterRaw);
         upsertMemoryCatalog(memoryDir, target.filePath);
-        // Mark superseded targets after the new record exists, so supersededBy always points
-        // at a live record.
+
+        // Mark superseded targets after the new record exists, so supersededBy always points at a
+        // live record. Targets a live record already supersedes are skipped and reported.
         const supersededIds: string[] = [];
-        for (const supersedeTarget of supersedeTargets) {
-          markRecordSuperseded(memoryDir, supersedeTarget.filePath, target.id);
-          supersededIds.push(supersedeTarget.id);
+        const skipped: Array<{ id: string; reason: string }> = [];
+        try {
+          for (const supersedeTarget of supersedeTargets) {
+            if (supersedeTarget.supersededBy && supersededByExists(memoryDir, supersedeTarget.supersededBy)) {
+              skipped.push({
+                id: supersedeTarget.id,
+                reason: `already superseded by @${supersedeTarget.supersededBy}`,
+              });
+              continue;
+            }
+            markRecordSuperseded(memoryDir, supersedeTarget.filePath, target.id);
+            supersededIds.push(supersedeTarget.id);
+          }
+        } catch (error) {
+          // Best-effort restore (not a guarantee): put back the target record (prior bytes when it
+          // pre-existed, otherwise delete the fresh file) and clear the markers already written.
+          try {
+            if (targetExists && beforeRaw !== undefined) {
+              fs.writeFileSync(target.filePath, beforeRaw);
+            } else {
+              fs.rmSync(target.filePath, { force: true });
+            }
+          } catch {
+            // ignore: the restore write failed or the file was already gone
+          }
+          for (const id of supersededIds) {
+            try {
+              const markedPath = findMemoryFileById(memoryDir, id);
+              const markedMemory = markedPath ? readMemoryFile(markedPath) : null;
+              if (markedPath && markedMemory) {
+                const restored = { ...markedMemory.frontmatter };
+                delete restored.supersededBy;
+                writeMemoryFile(markedPath, markedMemory.content, restored);
+              }
+            } catch {
+              // ignore per-record restore failures
+            }
+          }
+          rebuildMemoryCatalog(memoryDir);
+          throw new Error(`memory_write failed partway and was rolled back best-effort: ${(error as Error).message}`);
         }
+
         const relTarget = path.relative(memoryDir, target.filePath);
         const duplicateHints = formatConceptDuplicateHints(conceptNormalization.audit.possibleDuplicates);
         const writeWarnings = formatMemoryWriteWarnings(
@@ -731,7 +621,16 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
             ? `Memory file overwritten: ${relTarget} (@${target.id})`
             : `Memory file written: ${relTarget} (@${target.id})`;
         const responseParts = [status];
+        if (initialized) responseParts.push(`Initialized project memory: ${memoryDir}`);
         if (supersededIds.length) responseParts.push(`Superseded: ${supersededIds.map((id) => `@${id}`).join(", ")}`);
+        if (skipped.length) {
+          responseParts.push(`Skipped: ${skipped.map((entry) => `@${entry.id} (${entry.reason})`).join(", ")}`);
+        }
+        if (clearedSuperseder) {
+          responseParts.push(
+            `Cleared superseded marker (was superseded by @${clearedSuperseder}); record is current again.`,
+          );
+        }
         if (overwriteDiff?.text) responseParts.push(overwriteDiff.text);
         if (duplicateHints) responseParts.push(duplicateHints);
         if (writeWarnings) responseParts.push(writeWarnings);
@@ -740,10 +639,12 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
           details: {
             path: target.filePath,
             operation,
+            initialized,
             diff: overwriteDiff,
             frontmatter: { ...frontmatter, id: target.id, kind: target.kind },
             concepts: conceptNormalization.audit,
             superseded: supersededIds,
+            skipped,
             warnings: buildMemoryWriteWarnings({
               summary,
               claims,
@@ -777,63 +678,6 @@ export function registerMemoryWrite(pi: ExtensionAPI, settings: MemoryMdSettings
         diff: details?.diff,
       });
     },
-  });
-}
-
-export function registerMemoryList(pi: ExtensionAPI, settings: MemoryMdSettings): void {
-  pi.registerTool({
-    name: "memory_list",
-    label: "Memory List",
-    description: "List current-project memory files with stable IDs and lifecycle kinds",
-    parameters: Type.Object({
-      directory: Type.Optional(Type.String({ description: "Filter by state or events" })),
-      includeSuperseded: Type.Optional(
-        Type.Boolean({ description: "Include records hidden because a newer record supersedes them" }),
-      ),
-    }),
-
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const { directory, includeSuperseded } = params as { directory?: string; includeSuperseded?: boolean };
-      const memoryDir = getMemoryDir(settings, ctx.cwd);
-
-      try {
-        const normalizedDirectory = directory?.replace(/\/$/, "");
-        const catalogEntries = getMemoryCatalog(memoryDir);
-        const visibleEntries = includeSuperseded ? catalogEntries : filterSupersededEntries(memoryDir, catalogEntries);
-        const entries = visibleEntries
-          .filter((entry) => {
-            if (!normalizedDirectory) return true;
-            if (normalizedDirectory === "state") return entry.kind === "state";
-            if (normalizedDirectory === "events") return entry.kind === "event";
-            return entry.path === normalizedDirectory || entry.path.startsWith(`${normalizedDirectory}/`);
-          })
-          .map((entry) => ({
-            path: entry.path,
-            id: entry.id,
-            kind: entry.kind,
-            description: entry.description,
-            supersededBy: entry.supersededBy,
-          }));
-        const text = entries
-          .map(
-            (entry) =>
-              `  - ${entry.path} (@${entry.id})${entry.supersededBy ? ` (superseded by @${entry.supersededBy})` : ""}\n    ${entry.kind}: ${entry.description ?? "No description"}`,
-          )
-          .join("\n");
-        return {
-          content: [{ type: "text", text: `Memory files (${entries.length}):\n\n${text}` }],
-          details: { files: entries, count: entries.length },
-        };
-      } catch (error) {
-        return {
-          content: [{ type: "text", text: `Failed to list memory files: ${(error as Error).message}` }],
-          details: { error: true },
-        };
-      }
-    },
-
-    renderCall: (args, theme) => new Text(buildToolCallText("memory_list", args, theme), 0, 0),
-    renderResult: (result, options, theme) => renderCountResult(result, options, theme, "memory files"),
   });
 }
 
@@ -875,547 +719,194 @@ export function registerMemoryDelete(pi: ExtensionAPI, settings: MemoryMdSetting
   });
 }
 
+// Cluster warnings replace the old memory_check discovery: same-kind records sharing a canonical
+// concept are reported with a ready-to-copy merge call (memory_write + supersedes).
+function formatClusterWarnings(clusters: CompactClusterReport[]): string {
+  if (!clusters.length) return "";
+  const sections = clusters.map((cluster) => {
+    const ids = cluster.ids.map((id) => `@${id}`);
+    const merge = `memory_write({ path: "state/${cluster.concept}-summary.md", description: "${cluster.concept} summary", supersedes: [${cluster.ids.map((id) => `"@${id}"`).join(", ")}] })`;
+    return `- ${cluster.ids.length} ${cluster.kind} records share concept "${cluster.concept}", candidates for merge: [${ids.join(", ")}]\n  Merge: ${merge}`;
+  });
+  return `\n\nCluster warnings (${clusters.length} cluster${clusters.length > 1 ? "s" : ""}):\n${sections.join("\n")}`;
+}
+
+function buildMemoryListResult(memoryDir: string, kind?: "state" | "event", includeSuperseded?: boolean) {
+  const catalogEntries = getMemoryCatalog(memoryDir);
+  const visibleEntries = includeSuperseded ? catalogEntries : filterSupersededEntries(memoryDir, catalogEntries);
+  const files = visibleEntries
+    .filter((entry) => !kind || entry.kind === kind)
+    .map((entry) => ({
+      path: entry.path,
+      id: entry.id,
+      kind: entry.kind,
+      description: entry.description,
+      supersededBy: entry.supersededBy,
+    }));
+  const list = files
+    .map(
+      (entry) =>
+        `  - ${entry.path} (@${entry.id})${entry.supersededBy ? ` (superseded by @${entry.supersededBy})` : ""}\n    ${entry.kind}: ${entry.description ?? "No description"}`,
+    )
+    .join("\n");
+  const clusters = findCompactClusters(memoryDir);
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: `Memory files (${files.length}):\n\n${list}${formatClusterWarnings(clusters)}`,
+      },
+    ],
+    details: { mode: "list", files, count: files.length, clusters },
+  };
+}
+
 export function registerMemorySearch(pi: ExtensionAPI, settings: MemoryMdSettings): void {
   pi.registerTool({
     name: "memory_search",
     label: "Memory Search",
     description:
-      "Search memory files by content, tags, or description." +
+      "Search memory files by content, tags, or description, or omit query to list every record with its @id." +
       " Supports regex (e.g. 'typescript|javascript', 'fail.*build')." +
-      " Multi-word queries use OR logic ranked by relevance -- use keywords, not full sentences.",
+      " Multi-word queries use OR logic ranked by relevance -- use keywords, not full sentences." +
+      " The list mode also reports clusters of records that should be merged into one record.",
     parameters: Type.Object({
-      query: Type.String({
-        description:
-          "Search terms or regex pattern (e.g. 'hook|inject', 'fail.*build'). Multi-word = OR ranked by relevance.",
-      }),
-      searchIn: Type.Union(
-        [
-          Type.Literal("content"),
-          Type.Literal("tags"),
-          Type.Literal("description"),
-          Type.Literal("summary"),
-          Type.Literal("concepts"),
-          Type.Literal("claims"),
-          Type.Literal("id"),
-          Type.Literal("all"),
-        ],
-        { description: "Where to search" },
+      query: Type.Optional(
+        Type.String({
+          description:
+            "Search terms or regex pattern (e.g. 'hook|inject', 'fail.*build'). Multi-word = OR ranked by relevance. Omit to list all records.",
+        }),
+      ),
+      searchIn: Type.Optional(
+        Type.Union(
+          [
+            Type.Literal("content"),
+            Type.Literal("tags"),
+            Type.Literal("description"),
+            Type.Literal("summary"),
+            Type.Literal("concepts"),
+            Type.Literal("claims"),
+            Type.Literal("id"),
+            Type.Literal("all"),
+          ],
+          { description: "Where to search; defaults to all. Ignored when query is omitted." },
+        ),
       ),
       kind: Type.Optional(
         Type.Union([Type.Literal("state"), Type.Literal("event")], {
           description: "Limit results to current state or time-bound events",
         }),
       ),
-    }),
-
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const { query, searchIn, kind } = params as {
-        query: string;
-        searchIn: SearchField;
-        kind?: "state" | "event";
-      };
-      const memoryDir = getMemoryDir(settings, ctx.cwd);
-      const fileMap = new Map<string, import("./types.js").MemoryFile>();
-      const needsContent = searchIn === "content" || searchIn === "all";
-      for (const entry of getMemoryCatalog(memoryDir)) {
-        fileMap.set(
-          entry.path,
-          needsContent
-            ? memoryFileFromCatalogEntry(memoryDir, entry)
-            : {
-                path: path.join(memoryDir, entry.path),
-                frontmatter: {
-                  id: entry.id,
-                  kind: entry.kind,
-                  description: entry.description,
-                  summary: entry.summary,
-                  concepts: entry.concepts,
-                  claims: entry.claims,
-                  tags: entry.tags,
-                  created: entry.created,
-                  updated: entry.updated,
-                },
-                content: "",
-              },
-        );
-      }
-
-      const normalizedQuery = searchIn === "concepts" ? normalizeConceptSearchQuery(memoryDir, query) : query;
-      const conceptAliasFamilies =
-        searchIn === "concepts" && normalizedQuery.trim()
-          ? expandConceptSearchFamilies(memoryDir, normalizedQuery.split(/\s+/))
-          : undefined;
-      const hits = searchMemoryFiles({ files: fileMap, query: normalizedQuery, searchIn, kind, conceptAliasFamilies });
-
-      const catalogByPath = new Map(getMemoryCatalog(memoryDir).map((entry) => [entry.path, entry]));
-      const results = hits.map((h) => {
-        const entry = catalogByPath.get(h.path);
-        const id = entry?.id ?? h.path;
-        return {
-          path: h.path,
-          id,
-          kind: entry?.kind,
-          match: h.snippet,
-          matchCount: h.matchCount,
-          matchedIn: h.matchedIn,
-          next: `memory_read({ path: "@${id}", view: "knowledge" })`,
-        };
-      });
-
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              results.length === 0
-                ? "No results found."
-                : `Found ${results.length} result(s):\n\n${results
-                    .map((r) => `  ${r.path} (@${r.id})\n  ${r.match}\n  Next: ${r.next}`)
-                    .join("\n\n")}`,
-          },
-        ],
-        details: { results, count: results.length, query: normalizedQuery },
-      };
-    },
-
-    renderCall: (args, theme) => new Text(buildToolCallText("memory_search", args, theme), 0, 0),
-    renderResult: (result, options, theme) => renderCountResult(result, options, theme, "result(s)"),
-  });
-}
-
-export function registerMemoryAlias(pi: ExtensionAPI, settings: MemoryMdSettings): void {
-  pi.registerTool({
-    name: "memory_alias",
-    label: "Memory Alias",
-    description:
-      "Add an alias for an existing canonical concept so future memory_write and memory_search calls resolve it. " +
-      "Canonical must already exist in the concept dictionary; an alias that is currently a standalone concept is " +
-      "converted into an alias without rewriting existing records.",
-    parameters: Type.Object({
-      alias: Type.String({ description: "Alias label to resolve to the canonical concept" }),
-      canonical: Type.String({ description: "Existing canonical concept the alias should point to" }),
-    }),
-
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const { alias, canonical } = params as { alias: string; canonical: string };
-      const memoryDir = getMemoryDir(settings, ctx.cwd);
-      const result = addConceptAlias(memoryDir, alias, canonical);
-      const text = result.ok
-        ? result.converted
-          ? `Concept alias added: ${result.alias} -> ${result.canonical} (converted from standalone concept; existing records resolve lazily).`
-          : `Concept alias added: ${result.alias} -> ${result.canonical}.`
-        : `Failed to add concept alias: ${result.error}`;
-      return { content: [{ type: "text", text }], details: result };
-    },
-
-    renderCall: (args, theme) => new Text(buildToolCallText("memory_alias", args, theme), 0, 0),
-    renderResult: (result, options, theme) => {
-      if (options.isPartial) return renderText(theme.fg("warning", "Adding alias..."));
-      const details = result.details as { ok?: boolean };
-      return renderCollapsed(details?.ok ? "Alias added" : "Alias failed", getResultText(result), options, theme);
-    },
-  });
-}
-
-export function registerMemoryInit(
-  pi: ExtensionAPI,
-  settings: MemoryMdSettings,
-  isRepoInitialized: { value: boolean },
-): void {
-  pi.registerTool({
-    name: "memory_init",
-    label: "Memory Init",
-    description: "Initialize memory repository (clone or create initial structure)",
-    parameters: Type.Object({
-      force: Type.Optional(Type.Boolean({ description: "Reinitialize even if already set up" })),
-    }),
-
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const { force = false } = params as { force?: boolean };
-      if (isRepoInitialized.value && !force) {
-        return {
-          content: [{ type: "text", text: "Memory repository already initialized. Use force: true to reinitialize." }],
-          details: { initialized: true },
-        };
-      }
-      const result = await syncRepository(pi, settings, isRepoInitialized);
-      if (result.success) {
-        const memoryDir = getMemoryDir(settings, ctx.cwd);
-        ensureDirectoryStructure(memoryDir);
-        createDefaultFiles(memoryDir);
-      }
-      return {
-        content: [
-          {
-            type: "text",
-            text: result.success
-              ? `Memory repository initialized:\n${result.message}\n\nCreated project directory:\n  - records`
-              : `Initialization failed: ${result.message}`,
-          },
-        ],
-        details: { success: result.success },
-      };
-    },
-
-    renderCall: (args, theme) => new Text(buildToolCallText("memory_init", args, theme), 0, 0),
-    renderResult: (result, options, theme) => {
-      if (options.isPartial) return renderText(theme.fg("warning", "Initializing..."));
-      const details = result.details as { initialized?: boolean; success?: boolean };
-      if (details?.initialized) return renderText(theme.fg("muted", "Already initialized"));
-      const summary = details?.success ? "Initialized" : "Initialization failed";
-      return renderCollapsed(summary, getResultText(result), options, theme);
-    },
-  });
-}
-
-export function registerMemoryMigrate(pi: ExtensionAPI, settings: MemoryMdSettings): void {
-  pi.registerTool({
-    name: "memory_migrate",
-    label: "Memory Migrate",
-    description: "Migrate project memory after renaming a workspace folder",
-    parameters: Type.Object({
-      from: Type.String({ description: "Old workspace folder name that owns the existing memory" }),
-      to: Type.Optional(Type.String({ description: "New workspace folder name. Defaults to the current workspace." })),
-      mode: Type.Optional(
-        Type.Union([Type.Literal("move"), Type.Literal("merge")], {
-          description: "move fails if destination exists; merge moves missing files and fails on conflicts.",
-        }),
+      includeSuperseded: Type.Optional(
+        Type.Boolean({ description: "Include records hidden because a newer record supersedes them" }),
       ),
-      dryRun: Type.Optional(Type.Boolean({ description: "Preview migration without changing files" })),
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const {
-        from,
-        to,
-        mode = "move",
-        dryRun = false,
-      } = params as { from: string; to?: string; mode?: "move" | "merge"; dryRun?: boolean };
-      const result = migrateMemoryProject(settings, { cwd: ctx.cwd, from, to, mode, dryRun });
-
-      return {
-        content: [{ type: "text", text: formatMigrationResult(result) }],
-        details: result,
+        query,
+        searchIn = "all",
+        kind,
+        includeSuperseded,
+      } = params as {
+        query?: string;
+        searchIn?: SearchField;
+        kind?: "state" | "event";
+        includeSuperseded?: boolean;
       };
-    },
-
-    renderCall: (args, theme) => new Text(buildToolCallText("memory_migrate", args, theme), 0, 0),
-    renderResult: (result, options, theme) =>
-      options.isPartial ? renderText(theme.fg("warning", "Migrating...")) : renderSyncResult(result, options, theme),
-  });
-}
-
-export function registerMemoryCheck(pi: ExtensionAPI, settings: MemoryMdSettings): void {
-  pi.registerTool({
-    name: "memory_check",
-    label: "Memory Check",
-    description: "Check current project memory folder structure",
-    parameters: Type.Object({}),
-
-    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const memoryDir = getMemoryDir(settings, ctx.cwd);
-      if (!fs.existsSync(memoryDir)) {
+
+      try {
+        if (!query?.trim()) return buildMemoryListResult(memoryDir, kind, includeSuperseded);
+
+        const catalogEntries = getMemoryCatalog(memoryDir);
+        const visibleEntries = includeSuperseded ? catalogEntries : filterSupersededEntries(memoryDir, catalogEntries);
+        const fileMap = new Map<string, import("./types.js").MemoryFile>();
+        const needsContent = searchIn === "content" || searchIn === "all";
+        for (const entry of visibleEntries) {
+          fileMap.set(
+            entry.path,
+            needsContent
+              ? memoryFileFromCatalogEntry(memoryDir, entry)
+              : {
+                  path: path.join(memoryDir, entry.path),
+                  frontmatter: {
+                    id: entry.id,
+                    kind: entry.kind,
+                    description: entry.description,
+                    summary: entry.summary,
+                    concepts: entry.concepts,
+                    claims: entry.claims,
+                    tags: entry.tags,
+                    created: entry.created,
+                    updated: entry.updated,
+                  },
+                  content: "",
+                },
+          );
+        }
+
+        const normalizedQuery = searchIn === "concepts" ? normalizeConceptSearchQuery(memoryDir, query) : query;
+        const conceptAliasFamilies =
+          searchIn === "concepts" && normalizedQuery.trim()
+            ? expandConceptSearchFamilies(memoryDir, normalizedQuery.split(/\s+/))
+            : undefined;
+        const hits = searchMemoryFiles({
+          files: fileMap,
+          query: normalizedQuery,
+          searchIn,
+          kind,
+          conceptAliasFamilies,
+        });
+
+        const catalogByPath = new Map(catalogEntries.map((entry) => [entry.path, entry]));
+        const results = hits.map((h) => {
+          const entry = catalogByPath.get(h.path);
+          const id = entry?.id ?? h.path;
+          return {
+            path: h.path,
+            id,
+            kind: entry?.kind,
+            match: h.snippet,
+            matchCount: h.matchCount,
+            matchedIn: h.matchedIn,
+            next: `memory_read({ path: "@${id}", view: "knowledge" })`,
+          };
+        });
+
         return {
           content: [
             {
               type: "text",
-              text: `Memory directory not found: ${memoryDir}\n\nProject memory may not be initialized yet.`,
+              text:
+                results.length === 0
+                  ? "No results found."
+                  : `Found ${results.length} result(s):\n\n${results
+                      .map((r) => `  ${r.path} (@${r.id})\n  ${r.match}\n  Next: ${r.next}`)
+                      .join("\n\n")}`,
             },
           ],
-          details: { exists: false },
-        };
-      }
-
-      const { execSync } = await import("node:child_process");
-      let treeOutput = "";
-      try {
-        treeOutput = execSync(`tree -L 3 -I "node_modules" "${memoryDir}"`, { encoding: "utf-8" });
-      } catch {
-        try {
-          treeOutput = execSync(`find "${memoryDir}" -type d -not -path "*/node_modules/*" | head -20`, {
-            encoding: "utf-8",
-          });
-        } catch {
-          treeOutput = "Unable to generate directory tree. Please check permissions.";
-        }
-      }
-
-      const files = listMemoryFiles(memoryDir);
-      const relPaths = files.map((f) => path.relative(memoryDir, f));
-      // Read-only compact discovery: clusters of same-kind records sharing a canonical concept.
-      const clusters = findCompactClusters(memoryDir);
-      let discoveryText = "";
-      if (clusters.length) {
-        const sections = clusters.map((cluster) => {
-          const ids = cluster.ids.map((id) => `@${id}`);
-          const sample = `memory_compact({ path: "state/${cluster.concept}-summary.md", description: "${cluster.concept} lifecycle summary", supersede: [${cluster.ids.map((id) => `"@${id}"`).join(", ")}] })`;
-          return `- ${cluster.ids.length} ${cluster.kind} records share concept "${cluster.concept}", candidates for memory_compact: [${ids.join(", ")}]\n  Sample: ${sample}`;
-        });
-        discoveryText = `\n\nCompact discovery (${clusters.length} cluster${clusters.length > 1 ? "s" : ""}):\n${sections.join("\n")}`;
-      }
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Memory directory structure for project: ${path.basename(ctx.cwd)}\n\nPath: ${memoryDir}\n\n${treeOutput}\n\nMemory files (${relPaths.length}):\n${relPaths.map((p) => `  ${p}`).join("\n")}${discoveryText}`,
-          },
-        ],
-        details: { path: memoryDir, fileCount: relPaths.length, clusters },
-      };
-    },
-
-    renderCall: (_args, theme) => new Text(buildToolCallText("memory_check", {}, theme), 0, 0),
-    renderResult: (result, options, theme) => {
-      if (options.isPartial) return renderText(theme.fg("warning", "Checking..."));
-      const details = result.details as { exists?: boolean; fileCount?: number };
-      const summary = (details?.exists ?? true) ? `Structure: ${details?.fileCount ?? 0} files` : "Not initialized";
-      return renderCollapsed(summary, getResultText(result), options, theme);
-    },
-  });
-}
-
-export function registerMemoryCompact(pi: ExtensionAPI, settings: MemoryMdSettings): void {
-  pi.registerTool({
-    name: "memory_compact",
-    label: "Memory Compact",
-    description:
-      "Write a distilled state record, then mark every explicitly listed supersede @id as superseded so it drops out of injection and listings. The distill record is written FIRST, then the supersede markers are applied, so an interrupted run leaves the new state plus a few not-yet-hidden records (harmless duplication) instead of lost information.",
-    parameters: Type.Object({
-      path: Type.String({
-        description: "Relative .md path for the distilled state record (state/ or records/state.*.md)",
-      }),
-      description: Type.String({ description: "Concise purpose shown in the recent-memory index" }),
-      summary: Type.Optional(Type.String({ description: "One-sentence semantic summary for compact reads" })),
-      concepts: Type.Optional(Type.Array(Type.String({ description: "Core concepts captured by this memory" }))),
-      claims: Type.Optional(Type.Array(Type.String({ description: "Important conclusions or decisions" }))),
-      facts: Type.Optional(
-        Type.Record(Type.String(), Type.Any({ description: "Machine-readable scalar/array fact values" })),
-      ),
-      relations: Type.Optional(Type.Record(Type.String(), Type.String({ description: "Relation target stable @id" }))),
-      notes: Type.Optional(Type.String({ description: "Optional prose/evidence rendered after structured knowledge" })),
-      tags: Type.Optional(Type.Array(Type.String())),
-      supersede: Type.Array(
-        Type.String({
-          description: "Explicit @id or path of records this distill absorbs; they are marked superseded",
-        }),
-      ),
-    }),
-
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const memoryDir = getMemoryDir(settings, ctx.cwd);
-      try {
-        const {
-          path: relPath,
-          description,
-          summary,
-          concepts,
-          claims,
-          facts,
-          relations,
-          notes,
-          tags,
-          supersede,
-        } = params as {
-          path: string;
-          description: string;
-          tags?: string[];
-          supersede: string[];
-        } & StructuredMemoryFields;
-        if (!supersede?.length) throw new Error("memory_compact requires a supersede list of @ids or paths to absorb");
-
-        // Validate every supersede target BEFORE any file is touched: missing ids abort the
-        // whole call, already-superseded ids are skipped later (reported, not fatal).
-        const targets = supersede.map((ref) => {
-          const filePath = resolveMemoryFile(memoryDir, ref);
-          const memory = readMemoryFile(filePath);
-          if (!memory?.frontmatter.id) throw new Error(`Supersede target not found: ${ref}`);
-          return { filePath, id: memory.frontmatter.id, frontmatter: memory.frontmatter };
-        });
-
-        // memory_compact always produces a state record.
-        const target = resolveMemoryWriteTarget(memoryDir, relPath, "state");
-        if (target.kind !== "state") {
-          throw new Error("memory_compact writes a state record; use a state path or records/state.*.md");
-        }
-
-        const conceptNormalization = normalizeMemoryConcepts(memoryDir, concepts);
-        const normalizedConcepts = conceptNormalization.concepts;
-        const memoryContent = buildStructuredMemoryContent({
-          description,
-          summary,
-          concepts: normalizedConcepts,
-          claims,
-          facts,
-          relations,
-          notes,
-        });
-        const detectedSensitive = hasSensitiveMemoryInput({
-          content: memoryContent,
-          concepts: normalizedConcepts,
-          description,
-          facts,
-          relations,
-          summary,
-          claims,
-          notes,
-          tags,
-        });
-        const contentValidation = validateMemoryContent(memoryContent);
-        if (!contentValidation.valid) throw new Error(contentValidation.error);
-
-        const targetExists = fs.existsSync(target.filePath);
-        const existing = targetExists ? readMemoryFile(target.filePath) : null;
-        const beforeRaw = targetExists ? fs.readFileSync(target.filePath, "utf-8") : undefined;
-        const today = getCurrentDate();
-        const frontmatter: MemoryFrontmatter = {
-          ...existing?.frontmatter,
-          description,
-          summary,
-          concepts: normalizedConcepts,
-          claims,
-          created: existing?.frontmatter.created ?? today,
-          updated: today,
-          ...(tags && { tags }),
-        };
-        if (detectedSensitive) frontmatter.sensitive = true;
-        else delete frontmatter.sensitive;
-        delete frontmatter.id;
-        delete frontmatter.kind;
-        delete frontmatter.supersededBy;
-
-        // Step 1: write the distilled state record FIRST. If a later step fails, the state
-        // exists and only some markers are missing - harmless duplication, never data loss.
-        writeMemoryFile(target.filePath, memoryContent, frontmatter);
-        upsertMemoryCatalog(memoryDir, target.filePath);
-
-        // Step 2: mark each target superseded, with best-effort restore on failure. This is
-        // NOT an all-or-nothing mechanism - mirrors rollbackMergeWrites: we undo what we can
-        // (delete the fresh distill, clear markers already written) and say so honestly.
-        const marked: string[] = [];
-        const skipped: Array<{ id: string; reason: string }> = [];
-        try {
-          for (const targetRecord of targets) {
-            if (targetRecord.id === target.id) {
-              skipped.push({ id: targetRecord.id, reason: "is the new distill record itself" });
-              continue;
-            }
-            if (
-              targetRecord.frontmatter.supersededBy &&
-              supersededByExists(memoryDir, targetRecord.frontmatter.supersededBy)
-            ) {
-              skipped.push({
-                id: targetRecord.id,
-                reason: `already superseded by @${targetRecord.frontmatter.supersededBy}`,
-              });
-              continue;
-            }
-            markRecordSuperseded(memoryDir, targetRecord.filePath, target.id);
-            marked.push(targetRecord.id);
-          }
-        } catch (error) {
-          // Best-effort restore (not a guarantee): restore the distill target (prior bytes
-          // when it pre-existed, otherwise delete the fresh record) and clear the markers
-          // already applied, then let the caller see the failure.
-          try {
-            if (targetExists && beforeRaw !== undefined) {
-              fs.writeFileSync(target.filePath, beforeRaw);
-            } else {
-              fs.rmSync(target.filePath, { force: true });
-            }
-          } catch {
-            // ignore: the restore write failed or the file was already gone
-          }
-          for (const id of marked) {
-            try {
-              const markedPath = findMemoryFileById(memoryDir, id);
-              const markedMemory = markedPath ? readMemoryFile(markedPath) : null;
-              if (markedPath && markedMemory) {
-                const restored = { ...markedMemory.frontmatter };
-                delete restored.supersededBy;
-                writeMemoryFile(markedPath, markedMemory.content, restored);
-              }
-            } catch {
-              // ignore per-record restore failures
-            }
-          }
-          rebuildMemoryCatalog(memoryDir);
-          throw new Error(`memory_compact failed partway and was rolled back best-effort: ${(error as Error).message}`);
-        }
-
-        const relTarget = path.relative(memoryDir, target.filePath);
-        const duplicateHints = formatConceptDuplicateHints(conceptNormalization.audit.possibleDuplicates);
-        const writeWarnings = formatMemoryWriteWarnings(
-          buildMemoryWriteWarnings({
-            summary,
-            claims,
-            facts,
-            content: undefined,
-            finalSensitive: detectedSensitive,
-            detectedSensitive,
-            hygieneWarnings: conceptNormalization.audit.warnings,
-          }),
-        );
-        const responseParts = [`Memory compact written: ${relTarget} (@${target.id})`];
-        if (marked.length) responseParts.push(`Superseded: ${marked.map((id) => `@${id}`).join(", ")}`);
-        if (skipped.length) {
-          responseParts.push(`Skipped: ${skipped.map((entry) => `@${entry.id} (${entry.reason})`).join(", ")}`);
-        }
-        if (duplicateHints) responseParts.push(duplicateHints);
-        if (writeWarnings) responseParts.push(writeWarnings);
-        return {
-          content: [{ type: "text", text: responseParts.join("\n\n") }],
-          details: {
-            path: target.filePath,
-            frontmatter: { ...frontmatter, id: target.id, kind: target.kind },
-            superseded: marked,
-            skipped,
-            warnings: buildMemoryWriteWarnings({
-              summary,
-              claims,
-              facts,
-              content: undefined,
-              finalSensitive: detectedSensitive,
-              detectedSensitive,
-              hygieneWarnings: conceptNormalization.audit.warnings,
-            }),
-          },
+          details: { mode: "search", results, count: results.length, query: normalizedQuery },
         };
       } catch (error) {
         return {
-          content: [{ type: "text", text: `Failed to compact memory: ${(error as Error).message}` }],
+          content: [{ type: "text", text: `Failed to search memory: ${(error as Error).message}` }],
           details: { error: true },
         };
       }
     },
 
-    renderCall: (args, theme) => new Text(buildToolCallText("memory_compact", args, theme), 0, 0),
+    renderCall: (args, theme) => new Text(buildToolCallText("memory_search", args, theme), 0, 0),
     renderResult: (result, options, theme) => {
-      const details = result.details as { frontmatter?: { description?: string }; superseded?: string[] };
-      return renderCollapsed(
-        details?.superseded?.length
-          ? `Compact: absorbed ${details.superseded.length} record${details.superseded.length > 1 ? "s" : ""}`
-          : "Memory compact",
-        getResultText(result),
-        options,
-        theme,
-      );
+      const details = result.details as { mode?: string };
+      return renderCountResult(result, options, theme, details?.mode === "list" ? "memory files" : "result(s)");
     },
   });
 }
 
-export function registerAllMemoryTools(
-  pi: ExtensionAPI,
-  settings: MemoryMdSettings,
-  isRepoInitialized: { value: boolean },
-): void {
+export function registerAllMemoryTools(pi: ExtensionAPI, settings: MemoryMdSettings): void {
   registerMemoryRead(pi, settings);
   registerMemoryWrite(pi, settings);
-  registerMemoryList(pi, settings);
   registerMemorySearch(pi, settings);
-  registerMemoryAlias(pi, settings);
   registerMemoryDelete(pi, settings);
-  registerMemoryInit(pi, settings, isRepoInitialized);
-  registerMemoryMigrate(pi, settings);
-  registerMemoryCheck(pi, settings);
-  registerMemoryCompact(pi, settings);
 }

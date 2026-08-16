@@ -1,7 +1,7 @@
 import type { FrontmatterData } from "./frontmatter.js";
 
 /**
- * Type definitions for memory files, settings, and git operations.
+ * Type definitions for memory files and settings.
  */
 
 export type MemoryKind = "state" | "event";
@@ -70,28 +70,12 @@ export interface MemoryFile {
 
 export interface MemoryMdSettings {
   enabled?: boolean;
-  repoUrl?: string;
   localPath?: string;
-  autoSync?: {
-    onSessionStart?: boolean;
-  };
   injection?: "system-prompt" | "message-append";
   systemPrompt?: {
     maxTokens?: number;
     includeProjects?: string[];
   };
-}
-
-export interface GitResult {
-  stdout: string;
-  success: boolean;
-  timeout?: boolean;
-}
-
-export interface SyncResult {
-  success: boolean;
-  message: string;
-  updated?: boolean;
 }
 
 export type ParsedFrontmatter = FrontmatterData;

@@ -12,7 +12,6 @@
   "keywords": [
     "pi-package",
     "pi-extension",
-    "pi-skill",
     "memory",
     "markdown",
     "git",
@@ -34,11 +33,6 @@
   "pi": {
     "extensions": [
       "./index.ts"
-    ],
-    "skills": [
-      "./skills/memory-init/SKILL.md",
-      "./skills/memory-management/SKILL.md",
-      "./skills/memory-search/SKILL.md"
     ]
   },
   "files": [
@@ -48,7 +42,6 @@
     "tools.ts",
     "search-engine.ts",
     "types.ts",
-    "skills",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"

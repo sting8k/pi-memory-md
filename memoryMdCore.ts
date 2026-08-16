@@ -1,14 +1,12 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { parseFrontmatter, stringifyFrontmatter } from "./frontmatter.js";
 import type {
   ConceptAliasResult,
   ConceptDictionary,
   ConceptDuplicateHint,
   ConceptNormalizationAudit,
-  GitResult,
   MemoryFactValue,
   MemoryFile,
   MemoryFrontmatter,
@@ -26,9 +24,6 @@ export * from "./types.js";
  */
 
 const DEFAULT_LOCAL_PATH = path.join(os.homedir(), ".pi", "memory-md");
-const TIMEOUT_MS = 10000;
-const TIMEOUT_MESSAGE =
-  "Unable to connect to GitHub repository, connection timeout (10s). Please check your network connection or try again later.";
 
 /**
  * Settings
@@ -80,425 +75,10 @@ export function getMemoryDir(settings: MemoryMdSettings, cwd: string): string {
   return path.join(localPath, "projects", getProjectSlug(cwd));
 }
 
-export type MemoryMigrateMode = "move" | "merge";
-
-export interface MemoryMigrateInput {
-  cwd: string;
-  from: string;
-  to?: string;
-  mode?: MemoryMigrateMode;
-  dryRun?: boolean;
-}
-
-export interface MemoryMigrateResult {
-  success: boolean;
-  message: string;
-  dryRun: boolean;
-  mode: MemoryMigrateMode;
-  from: string;
-  to: string;
-  fromPath: string;
-  toPath: string;
-  files: number;
-  conflicts: string[];
-  candidates?: string[];
-}
-
-function validateProjectFolderName(name: string, label: string): string | null {
-  if (!name.trim()) return `${label} is required`;
-  if (path.isAbsolute(name) || name.includes("/") || name.includes("\\") || name === "." || name === "..") {
-    return `${label} must be a workspace folder name, not a path`;
-  }
-  if (name.startsWith(".")) return `${label} must not be a hidden or reserved folder name`;
-  return null;
-}
-
-function listProjectMemoryFolders(memoryRoot: string): string[] {
-  if (!fs.existsSync(memoryRoot)) return [];
-  return fs
-    .readdirSync(memoryRoot, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory() && entry.name !== ".git")
-    .map((entry) => entry.name)
-    .sort();
-}
-
-function isNotFoundError(error: unknown): boolean {
-  return (error as NodeJS.ErrnoException).code === "ENOENT";
-}
-
-function formatFsError(error: unknown): string {
-  const err = error as NodeJS.ErrnoException;
-  return err.message || String(error);
-}
-
-function lstatIfExists(targetPath: string): fs.Stats | null {
-  try {
-    return fs.lstatSync(targetPath);
-  } catch (error) {
-    if (isNotFoundError(error)) return null;
-    throw error;
-  }
-}
-
-interface FileInventory {
-  files: string[];
-  symlinks: string[];
-}
-
-function listFilesRecursive(dir: string): FileInventory {
-  const files: string[] = [];
-  const symlinks: string[] = [];
-
-  function walk(current: string) {
-    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
-      const fullPath = path.join(current, entry.name);
-      if (entry.isSymbolicLink()) {
-        symlinks.push(fullPath);
-      } else if (entry.isDirectory()) {
-        walk(fullPath);
-      } else if (entry.isFile()) {
-        files.push(fullPath);
-      }
-    }
-  }
-
-  walk(dir);
-  return { files: files.sort(), symlinks: symlinks.sort() };
-}
-
-function detectMergeConflicts(toPath: string, relativeFiles: string[]): string[] {
-  const conflicts: string[] = [];
-
-  for (const relPath of relativeFiles) {
-    const destFile = path.join(toPath, relPath);
-    if (lstatIfExists(destFile)) {
-      conflicts.push(relPath);
-      continue;
-    }
-
-    const parts = relPath.split(path.sep);
-    for (let i = 1; i < parts.length; i++) {
-      const ancestor = path.join(toPath, ...parts.slice(0, i));
-      const ancestorStats = lstatIfExists(ancestor);
-      if (ancestorStats && !ancestorStats.isDirectory()) {
-        conflicts.push(relPath);
-        break;
-      }
-    }
-  }
-
-  return conflicts;
-}
-
-function getMissingDirectories(targetDir: string, stopDir: string): string[] {
-  const relative = path.relative(stopDir, targetDir);
-  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return [];
-
-  const missingDirs: string[] = [];
-  let current = stopDir;
-  for (const part of relative.split(path.sep)) {
-    current = path.join(current, part);
-    if (!lstatIfExists(current)) missingDirs.push(current);
-  }
-  return missingDirs;
-}
-
-function rollbackMergeWrites(
-  copiedFiles: string[],
-  attemptedFile: string | null,
-  createdDirs: string[],
-  toPath: string,
-): string[] {
-  const failures: string[] = [];
-  const filesToRemove = attemptedFile ? [...copiedFiles, attemptedFile] : copiedFiles;
-
-  for (const file of [...new Set(filesToRemove)].reverse()) {
-    try {
-      fs.rmSync(file, { force: true });
-    } catch {
-      failures.push(path.relative(toPath, file));
-    }
-  }
-
-  const dirsToRemove = [...new Set(createdDirs)].sort((a, b) => b.length - a.length);
-  for (const dir of dirsToRemove) {
-    try {
-      fs.rmdirSync(dir);
-    } catch (error) {
-      if (!isNotFoundError(error)) failures.push(path.relative(toPath, dir));
-    }
-  }
-
-  return failures;
-}
-
-function legacyDestination(relativePath: string, duplicateNames: Set<string>): string {
-  const normalized = relativePath.split(path.sep).join("/");
-  if (normalized === "core/user/identity.md") return path.join("state", "identity.md");
-  if (normalized === "core/user/prefer.md") return path.join("state", "preferences.md");
-
-  const basename = path.basename(relativePath);
-  if (!duplicateNames.has(basename)) return path.join("events", basename);
-  const prefix = path.dirname(relativePath).split(path.sep).map(idSegment).filter(Boolean).join("-");
-  return path.join("events", `${prefix}-${basename}`);
-}
-
-function migrateLegacyProject(
-  legacyPath: string,
-  toPath: string,
-  result: Omit<MemoryMigrateResult, "success" | "message" | "files" | "conflicts">,
-  mode: MemoryMigrateMode,
-  dryRun: boolean,
-): MemoryMigrateResult {
-  const inventory = listFilesRecursive(legacyPath);
-  const markdownFiles = inventory.files.filter((file) => file.endsWith(".md"));
-  const unsupported = inventory.files
-    .filter((file) => !file.endsWith(".md"))
-    .map((file) => path.relative(legacyPath, file));
-  if (inventory.symlinks.length > 0 || unsupported.length > 0) {
-    const conflicts = [...inventory.symlinks.map((file) => path.relative(legacyPath, file)), ...unsupported];
-    return {
-      ...result,
-      success: false,
-      message: "Legacy migration supports Markdown files only",
-      files: markdownFiles.length,
-      conflicts,
-    };
-  }
-
-  const nameCounts = new Map<string, number>();
-  for (const file of markdownFiles) {
-    const name = path.basename(file);
-    nameCounts.set(name, (nameCounts.get(name) ?? 0) + 1);
-  }
-  const duplicateNames = new Set(
-    Array.from(nameCounts)
-      .filter(([, count]) => count > 1)
-      .map(([name]) => name),
-  );
-  const mappings = markdownFiles.map((source) => {
-    const relative = path.relative(legacyPath, source);
-    return { source, destination: path.join(toPath, legacyDestination(relative, duplicateNames)) };
-  });
-  const relativeDestinations = mappings.map(({ destination }) => path.relative(toPath, destination));
-  const conflicts = detectMergeConflicts(toPath, relativeDestinations);
-
-  if (lstatIfExists(toPath) && mode === "move") {
-    return {
-      ...result,
-      success: false,
-      message: `Destination memory folder already exists: ${result.to}. Use mode: "merge" to merge without overwriting.`,
-      files: mappings.length,
-      conflicts,
-    };
-  }
-  if (conflicts.length > 0) {
-    return {
-      ...result,
-      success: false,
-      message: `Legacy migration blocked by ${conflicts.length} conflict(s)`,
-      files: mappings.length,
-      conflicts,
-    };
-  }
-  if (dryRun) {
-    return {
-      ...result,
-      success: true,
-      message: `Legacy project ${result.from} can be migrated to Memory v2`,
-      files: mappings.length,
-      conflicts: [],
-    };
-  }
-
-  const written: string[] = [];
-  try {
-    for (const { source, destination } of mappings) {
-      const memory = readMemoryFile(source);
-      if (!memory) throw new Error(`Unable to read ${path.relative(legacyPath, source)}`);
-      const kind = inferMemoryKind(toPath, destination);
-      if (!kind) throw new Error(`Unable to classify ${path.relative(legacyPath, source)}`);
-      const fallbackDate = fs.statSync(source).mtime.toISOString().slice(0, 10);
-      writeMemoryFile(destination, memory.content, {
-        ...memory.frontmatter,
-        id: createMemoryId(toPath, destination, kind),
-        kind,
-        description: memory.frontmatter.description || path.basename(source, ".md"),
-        created: memory.frontmatter.created ?? memory.frontmatter.updated ?? fallbackDate,
-        updated: memory.frontmatter.updated ?? memory.frontmatter.created ?? fallbackDate,
-      });
-      written.push(destination);
-    }
-    fs.rmSync(legacyPath, { recursive: true });
-  } catch (error) {
-    for (const file of written.reverse()) fs.rmSync(file, { force: true });
-    return {
-      ...result,
-      success: false,
-      message: `Legacy migration failed and destination writes were rolled back: ${formatFsError(error)}`,
-      files: mappings.length,
-      conflicts: [],
-    };
-  }
-
-  return {
-    ...result,
-    success: true,
-    message: `Migrated legacy project ${result.from} to Memory v2 project ${result.to}`,
-    files: mappings.length,
-    conflicts: [],
-  };
-}
-
-export function migrateMemoryProject(settings: MemoryMdSettings, input: MemoryMigrateInput): MemoryMigrateResult {
-  const mode = input.mode ?? "move";
-  const dryRun = input.dryRun ?? false;
-  const toInput = input.to?.trim() || getProjectSlug(input.cwd);
-  const fromInput = input.from.trim();
-  const to = toProjectSlug(toInput);
-  const from = toProjectSlug(fromInput);
-  const currentMemoryDir = getMemoryDir(settings, input.cwd);
-  const memoryRoot = path.dirname(currentMemoryDir);
-  const fromPath = path.join(memoryRoot, from);
-  const toPath = path.join(memoryRoot, to);
-  const baseResult = { dryRun, mode, from, to, fromPath, toPath, files: 0, conflicts: [] as string[] };
-
-  const fail = (message: string, extra?: Partial<MemoryMigrateResult>): MemoryMigrateResult => ({
-    ...baseResult,
-    ...extra,
-    success: false,
-    message,
-  });
-
-  try {
-    const fromError = validateProjectFolderName(fromInput, "from");
-    if (fromError) return fail(fromError);
-
-    const toError = validateProjectFolderName(toInput, "to");
-    if (toError) return fail(toError);
-
-    const fromStats = lstatIfExists(fromPath);
-    if (!fromStats) {
-      const legacyPath = path.join(path.dirname(memoryRoot), fromInput);
-      const legacyStats = lstatIfExists(legacyPath);
-      if (legacyStats?.isDirectory()) {
-        return migrateLegacyProject(legacyPath, toPath, { ...baseResult, fromPath: legacyPath }, mode, dryRun);
-      }
-      return fail(`Source memory folder not found: ${from}`, { candidates: listProjectMemoryFolders(memoryRoot) });
-    }
-    if (from === to) return fail("Source and destination project folders are the same");
-    if (!fromStats.isDirectory()) return fail(`Source exists but is not a directory: ${from}`);
-
-    const inventory = listFilesRecursive(fromPath);
-    const files = inventory.files;
-    const relativeFiles = files.map((file) => path.relative(fromPath, file));
-    const resultBase = { ...baseResult, files: files.length };
-    const symlinks = inventory.symlinks.map((file) => path.relative(fromPath, file));
-
-    const toStats = lstatIfExists(toPath);
-    if (!toStats) {
-      if (!dryRun) {
-        try {
-          fs.renameSync(fromPath, toPath);
-        } catch (error) {
-          return { ...resultBase, success: false, message: `Move failed: ${formatFsError(error)}` };
-        }
-      }
-      return { ...resultBase, success: true, message: `Moved project memory from ${from} to ${to}` };
-    }
-
-    if (!toStats.isDirectory()) {
-      return { ...resultBase, success: false, message: `Destination exists but is not a directory: ${to}` };
-    }
-
-    if (mode === "move") {
-      return {
-        ...resultBase,
-        success: false,
-        message: `Destination memory folder already exists: ${to}. Use mode: "merge" to merge without overwriting.`,
-      };
-    }
-
-    if (symlinks.length > 0) {
-      return {
-        ...resultBase,
-        success: false,
-        message: `Merge blocked by ${symlinks.length} unsupported symlink(s)`,
-        conflicts: symlinks,
-      };
-    }
-
-    const conflicts = detectMergeConflicts(toPath, relativeFiles);
-    if (conflicts.length > 0) {
-      return {
-        ...resultBase,
-        success: false,
-        message: `Merge blocked by ${conflicts.length} conflict(s)`,
-        conflicts,
-      };
-    }
-
-    if (!dryRun) {
-      const copiedFiles: string[] = [];
-      const createdDirs: string[] = [];
-      let currentRelPath = "";
-      let currentDestFile: string | null = null;
-
-      try {
-        for (const file of files) {
-          currentRelPath = path.relative(fromPath, file);
-          const destFile = path.join(toPath, currentRelPath);
-          currentDestFile = destFile;
-          const destDir = path.dirname(destFile);
-          const missingDirs = getMissingDirectories(destDir, toPath);
-          fs.mkdirSync(destDir, { recursive: true });
-          createdDirs.push(...missingDirs);
-          fs.copyFileSync(file, destFile, fs.constants.COPYFILE_EXCL);
-          copiedFiles.push(destFile);
-          currentDestFile = null;
-        }
-      } catch (error) {
-        const rollbackFailures = rollbackMergeWrites(copiedFiles, currentDestFile, createdDirs, toPath);
-        const rollbackMessage =
-          rollbackFailures.length === 0
-            ? "Destination writes were rolled back."
-            : `Rollback could not remove ${rollbackFailures.length} path(s): ${rollbackFailures.join(", ")}`;
-        return {
-          ...resultBase,
-          success: false,
-          message: `Merge failed while copying ${currentRelPath || "file"}: ${formatFsError(error)}. Source was left intact. ${rollbackMessage}`,
-        };
-      }
-
-      try {
-        fs.rmSync(fromPath, { recursive: true, force: true });
-      } catch (error) {
-        return {
-          ...resultBase,
-          success: false,
-          message: `Merge copied files into ${to}, but failed to remove source ${from}: ${formatFsError(error)}. Remove the source folder manually after verifying the destination.`,
-        };
-      }
-    }
-
-    return { ...resultBase, success: true, message: `Merged project memory from ${from} into ${to}` };
-  } catch (error) {
-    return fail(`Migration failed: ${formatFsError(error)}`);
-  }
-}
-
-function getRepoName(settings: MemoryMdSettings): string {
-  if (!settings.repoUrl) return "memory-md";
-  const match = settings.repoUrl.match(/\/([^/]+?)(\.git)?$/);
-  return match ? match[1] : "memory-md";
-}
-
 export function loadSettings(): MemoryMdSettings {
   const DEFAULT_SETTINGS: MemoryMdSettings = {
     enabled: true,
-    repoUrl: "",
     localPath: DEFAULT_LOCAL_PATH,
-    autoSync: { onSessionStart: true },
     injection: "message-append",
     systemPrompt: {
       maxTokens: 10000,
@@ -525,86 +105,6 @@ export function loadSettings(): MemoryMdSettings {
     console.warn("Failed to load memory settings:", error);
     return DEFAULT_SETTINGS;
   }
-}
-
-/**
- * Git operations
- */
-
-export async function gitExec(
-  pi: ExtensionAPI,
-  cwd: string,
-  args: string[],
-  timeoutMs = TIMEOUT_MS,
-): Promise<GitResult> {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const result = await pi.exec("git", args, { cwd, signal: controller.signal });
-    clearTimeout(timeoutId);
-    return { stdout: result.stdout || "", success: true };
-  } catch (error) {
-    clearTimeout(timeoutId);
-    const err = error as { name?: string; code?: string; message?: string };
-    const isTimeout = err?.name === "AbortError" || err?.code === "ABORT_ERR";
-    if (isTimeout) return { stdout: "", success: false, timeout: true };
-    return { stdout: err?.message || String(error), success: false };
-  }
-}
-
-export async function syncRepository(
-  pi: ExtensionAPI,
-  settings: MemoryMdSettings,
-  isRepoInitialized: { value: boolean },
-): Promise<{ success: boolean; message: string; updated?: boolean }> {
-  const { localPath, repoUrl } = settings;
-
-  if (!localPath) {
-    return { success: false, message: "Local memory path not configured" };
-  }
-
-  if (!repoUrl) {
-    fs.mkdirSync(localPath, { recursive: true });
-    isRepoInitialized.value = true;
-    return { success: true, message: `Using local memory directory: ${localPath}` };
-  }
-
-  const repoName = getRepoName(settings);
-
-  if (fs.existsSync(localPath)) {
-    const gitDir = path.join(localPath, ".git");
-    if (!fs.existsSync(gitDir)) {
-      return { success: false, message: `Directory exists but is not a git repo: ${localPath}` };
-    }
-
-    const pullResult = await gitExec(pi, localPath, ["pull", "--rebase", "--autostash"]);
-    if (pullResult.timeout) return { success: false, message: TIMEOUT_MESSAGE };
-    if (!pullResult.success) return { success: false, message: pullResult.stdout || "Pull failed" };
-
-    isRepoInitialized.value = true;
-    const updated = pullResult.stdout.includes("Updating") || pullResult.stdout.includes("Fast-forward");
-
-    return {
-      success: true,
-      message: updated ? `Pulled latest changes from [${repoName}]` : `[${repoName}] is already latest`,
-      updated,
-    };
-  }
-
-  fs.mkdirSync(localPath, { recursive: true });
-
-  const memoryDirName = path.basename(localPath);
-  const parentDir = path.dirname(localPath);
-  const cloneResult = await gitExec(pi, parentDir, ["clone", repoUrl, memoryDirName]);
-
-  if (cloneResult.timeout) return { success: false, message: TIMEOUT_MESSAGE };
-  if (cloneResult.success) {
-    isRepoInitialized.value = true;
-    return { success: true, message: `Cloned [${repoName}] successfully`, updated: true };
-  }
-
-  return { success: false, message: cloneResult.stdout || "Clone failed" };
 }
 
 /**
@@ -1538,9 +1038,9 @@ export function findConceptContainmentDuplicate(
 }
 
 /**
- * Compact discovery: group records by (kind, canonical concept) and report clusters of at
- * least minSize records as candidates for memory_compact. Read-only; superseded records are
- * already being phased out so they are excluded.
+ * Cluster discovery: group records by (kind, canonical concept) and report clusters of at
+ * least minSize records as merge candidates for memory_write + supersedes. Read-only;
+ * superseded records are already being phased out so they are excluded.
  */
 export interface CompactClusterReport {
   kind: MemoryKind;
@@ -1743,7 +1243,16 @@ function createDefaultFiles(memoryDir: string): void {
   }
 }
 
-export { createDefaultFiles, ensureDirectoryStructure };
+/**
+ * Auto-init: the first memory_write in a project creates the local records/ layout and the
+ * default records. Local only - there is no remote clone step.
+ */
+export function ensureProjectMemoryInitialized(memoryDir: string): boolean {
+  if (fs.existsSync(path.join(memoryDir, MEMORY_RECORDS_DIR))) return false;
+  ensureDirectoryStructure(memoryDir);
+  createDefaultFiles(memoryDir);
+  return true;
+}
 
 const MAX_INJECTED_MEMORY_FILES = 10;
 const STATE_INJECTION_QUOTA = 5;

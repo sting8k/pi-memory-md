@@ -47,16 +47,24 @@ Each Git workspace gets an isolated project directory derived from its Git root 
 | Tool | Purpose |
 |---|---|
 | `memory_read` | Read by relative path or stable `@id`, with `full`, `summary`, or `knowledge` projections |
-| `memory_write` | Create or fully replace one memory file, preferably from structured semantic fields |
-| `memory_list` | List project memory metadata |
-| `memory_search` | Search content or metadata, optionally by kind |
-| `memory_alias` | Add an alias for an existing canonical concept |
+| `memory_write` | Create or fully replace one memory file, merge records via `supersedes`, and auto-create project memory on the first write |
+| `memory_search` | Search content or metadata; omit `query` to list every record plus cluster warnings |
 | `memory_delete` | Explicitly delete one memory record and reconcile derived metadata |
-| `memory_check` | Inspect the folder structure and discover compact clusters |
-| `memory_compact` | Write a distilled state record and supersede an explicit list of records |
-| `memory_init` | Initialize identity-addressed `records/` |
-| `memory_migrate` | Rename a project or migrate a legacy project layout |
 
+Four tools cover the whole lifecycle. Compaction is `memory_write` with `supersedes`, listing is `memory_search` without `query`, and initialization happens on the first write.
+
+
+## Agent workflow
+
+```text
+START: memory_search({ query: "task keywords", searchIn: "all" })
+READ:  memory_read({ path: "@event.or-state-id", view: "knowledge" })
+END:   memory_write({ path: "events/<topic>.md", kind: "event", summary, claims or facts })
+```
+
+- Default to `event` for reports, progress, audits, and investigations. Use `state` only for knowledge that is still true tomorrow, such as preferences, active architecture, or runtime conventions. When unsure, write an `event`.
+- Update canonical state in place instead of creating dated snapshots.
+- Do not dump a whole session into memory; write durable findings only.
 
 ## Frontmatter
 
@@ -87,7 +95,7 @@ Prefer structured semantic fields over long prose. `memory_write` can generate c
 
 - `summary`: one-sentence gist;
 - `concepts`: retrieval concepts;
-  Concepts are normalized to canonical lowercase kebab-case labels through `.concepts.json`; known aliases resolve automatically and unknown concepts are auto-registered. Ambiguous near-duplicates are reported as hints, not blocked. Hash, number, and date-like concepts are blocked with a warning to move them into `facts`/`tags`; sentence-like concepts (six or more hyphen-separated words) warn to move them into `claims` but still register. Use `memory_alias({ alias, canonical })` to map duplicate spellings to an existing canonical concept.
+  Concepts are normalized to canonical lowercase kebab-case labels through `.concepts.json`; known aliases resolve automatically and unknown concepts are auto-registered. Ambiguous near-duplicates are reported as hints, not blocked. Hash, number, and date-like concepts are blocked with a warning to move them into `facts`/`tags`; sentence-like concepts (six or more hyphen-separated words) warn to move them into `claims` but still register.
 - `claims`: decisions or conclusions;
 - `facts`: JSON scalar/array values rendered into the facts block; nested plain objects are flattened to dotted keys and keys are normalized to lowercase identifiers;
 - `relations`: stable `@id` links rendered as relation facts;
@@ -122,7 +130,7 @@ Project memory keeps concept vocabulary simple and transparent:
 }
 ```
 
-`memory_write` normalizes concept spelling, resolves aliases, deduplicates concepts, and registers new concepts automatically. `memory_search({ searchIn: "concepts" })` is alias-aware and exact: unknown concept queries normalize to canonical labels and return no results when absent instead of falling back to broad token matching. The tool does not silently merge ambiguous semantic near-duplicates; it only returns advisory duplicate hints in tool details. `memory_alias({ alias, canonical })` makes duplicate hints actionable by registering an alias for an existing canonical concept; a standalone concept can be converted into an alias without rewriting existing records, and records stored under the old name stay findable through both the alias and the canonical (query-side alias-family expansion).
+`memory_write` normalizes concept spelling, resolves aliases, deduplicates concepts, and registers new concepts automatically. `memory_search({ searchIn: "concepts" })` is alias-aware and exact: unknown concept queries normalize to canonical labels and return no results when absent instead of falling back to broad token matching. The tool does not silently merge ambiguous semantic near-duplicates; it only returns advisory duplicate hints in tool details. Aliases already present in `.concepts.json` keep resolving on both sides: records stored under an old spelling stay findable through both the alias and the canonical (query-side alias-family expansion).
 
 Memory writes store ISO `created`/`updated` timestamps so same-day records can still sort by write time. Explicit `memory_delete` removes one record, updates `.catalog.json`, and reconciles `.concepts.json` by preserving aliases and active alias targets while only considering the deleted record's concepts for cleanup.
 
@@ -138,42 +146,37 @@ Memory writes store ISO `created`/`updated` timestamps so same-day records can s
 
 - Chains resolve naturally: if `@c` is superseded by `@b` and `@b` by `@a`, both `@b` and `@c` are hidden while `@a` exists. Deleting `@a` resurrects `@b` (its superseder is gone) while `@c` stays hidden (its superseder `@b` still lives).
 - `memory_delete` also clears `supersededBy` markers that point at the deleted record, so resurrection is explicit on disk too.
-- `memory_list` hides superseded records by default; pass `includeSuperseded: true` to see them (marked `(superseded by @id)`).
+- `memory_search` hides superseded records by default in both modes; pass `includeSuperseded: true` to see them (marked `(superseded by @id)` in list mode).
 - `memory_read` reads a hidden record normally and appends a `Note: superseded by @id` line when the superseder still exists.
-- `memory_write` validates every `supersedes` reference before writing anything, and refuses self-supersede.
+- `memory_write` validates every `supersedes` reference before writing anything, and refuses self-supersede. A reference that a live record already supersedes is skipped and reported, not re-marked.
+- Writing to a superseded record clears its marker and says so: an explicit write makes that record current again.
 
-### Pre-commit dedup for state only
+### Pre-write dedup for state only
 
-Events are append-only and never deduped. For `state` creates (target ID not yet existing), `memory_write` runs two checks before any file write, both bypassed by `forceCreate: true`:
+Events are append-only and never deduped. For `state` creates (target ID not yet existing), `memory_write` runs two checks before any file write, both bypassed by `forceCreate: true` and by a non-empty `supersedes` list (an explicit merge is itself the dedup decision):
 
 1. **Deterministic ID-family**: when the new ID equals an existing non-superseded state ID plus a version-ish suffix (`-v2`, `-v3`, `-final`, `-new`, `-latest`, `-done`, or a date suffix), the write is routed to an overwrite of the existing record, the diff is shown, and the response says `routed to overwrite @old (ID-family match)`. The longest matching prefix wins.
 2. **Concept containment**: when the new concept set and an existing non-superseded state record's set satisfy one-contains-the-other (both non-empty), the write is REJECTED with a single hint naming the similar record, its path, and `forceCreate: true`. Fuzzy similarity, Jaccard, or description matching are deliberately not used: auto-routing a fuzzy match risks silently overwriting the wrong record.
 
-### memory_compact: explicit distill + ordered markers
+### Merging records: explicit distill + ordered markers
 
-`memory_compact({ path, description, ..., supersede: ["@a", "@b", ...] })` is the manual compaction path: the agent supplies the distilled content and the EXPLICIT list of IDs to absorb; nothing is auto-matched by concept.
+`memory_write({ path, description, ..., supersedes: ["@a", "@b", ...] })` is the manual compaction path: the agent supplies the distilled content and the EXPLICIT list of IDs to absorb; nothing is auto-matched by concept.
 
-The tool writes in a safe order: the distilled `state` record is written FIRST, then each `supersede` target is marked `supersededBy` (and its catalog entry updated). If a later step fails, the state already exists and only some markers are missing — harmless duplication, never lost information. On a mid-way failure it performs a best-effort restore (delete the fresh distill, clear already-applied markers) and says so honestly; this is not an all-or-nothing guarantee.
+The write order is write-then-mark: the distilled record is written FIRST, then each `supersedes` target is marked `supersededBy` (and its catalog entry updated). If a later step fails, the new record already exists and only some markers are missing — harmless duplication, never lost information. On a mid-way failure it performs a best-effort restore (restore the target's prior bytes or delete the fresh file, clear already-applied markers) and says so honestly; this is not an all-or-nothing guarantee.
 
-Validation happens before any file is touched: every `supersede` ID must exist or the whole call fails. A target that is already superseded is skipped and reported in the response. The response lists the IDs actually superseded so the agent sees what was absorbed.
+Validation happens before any file is touched: every `supersedes` ID must exist or the whole call fails. A target that a live record already supersedes is skipped and reported in the response. The response lists the IDs actually superseded so the agent sees what was absorbed.
 
-### Discovery in memory_check
+### Cluster warnings in list mode
 
-`memory_check` scans the catalog and reports same-kind record clusters that share at least one canonical concept with 4+ members, as candidates for `memory_compact`, including a ready-to-copy sample call. It is read-only; superseded records are excluded because they are already being phased out.
+`memory_search` without a `query` lists the catalog and appends cluster warnings: same-kind record clusters sharing at least one canonical concept with 4+ members, each with a ready-to-copy `memory_write(..., supersedes: [...])` merge call. It is read-only; superseded records are excluded because they are already being phased out.
 
 ### Catalog rebuilds from frontmatter
 
 The catalog is derived and rebuildable: `rebuildMemoryCatalog` reconstructs every entry — including `supersededBy` — from the files' frontmatter. Legacy records without `supersededBy` behave exactly as before; no migration is required.
 
-## Legacy migration
+## Initialization
 
-Preview before applying:
-
-```text
-memory_migrate({ from: "Old Project", to: "Old Project", dryRun: true })
-```
-
-Then run the same call without `dryRun`. This is a compatibility path for old data: it may create readable legacy `state/` and `events/` files. New writes after initialization use `records/`.
+There is no init tool and no git layer: memory is local-only. The first `memory_write` in a project creates `records/` plus the two default records (`state.identity`, `state.preferences`) and reports it in the response. Renaming a project folder means moving `~/.pi/memory-md/projects/<slug>/` by hand.
 
 ## Configuration
 
@@ -181,13 +184,10 @@ Settings live in `~/.pi/agent/settings.json`:
 
 ```json
 {
-  "memory-md": {
+  "pi-memory-md": {
     "enabled": true,
     "localPath": "~/.pi/memory-md",
-    "repoUrl": "https://github.com/username/memory-repo.git",
-    "autoSync": {
-      "onSessionStart": true
-    }
+    "injection": "message-append"
   }
 }
 ```
